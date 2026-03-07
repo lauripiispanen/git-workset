@@ -1,0 +1,11 @@
+[package]
+name = "git-workset"
+version = "0.1.0"
+edition = "2021"
+description = "Named sparse-checkout profiles for git worktrees with submodule and LFS management"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
