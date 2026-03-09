@@ -18,10 +18,16 @@ pub fn find_repo_root() -> Result<PathBuf> {
 
     // git-common-dir returns the .git directory; we want the parent
     if common_path.ends_with(".git") {
-        Ok(common_path
+        let parent = common_path
             .parent()
             .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".")))
+            .unwrap_or_else(|| PathBuf::from("."));
+        // When .git is relative (common case), parent is "" — normalize to "."
+        Ok(if parent.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            parent
+        })
     } else {
         // bare repo or worktree — resolve to absolute
         let abs = std::fs::canonicalize(&common_path)?;

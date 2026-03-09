@@ -209,7 +209,7 @@ fn cmd_clone(
 
 fn cmd_carve(path: &PathBuf, branch: &str, workset_name: &str) -> Result<()> {
     let repo_root = git::find_repo_root()?;
-    let config = WorksetsConfig::load(&repo_root)?;
+    let config = WorksetsConfig::load_from_git(&repo_root, branch)?;
     let workset = config.get_workset(workset_name)?;
 
     let abs_path = if path.is_absolute() {

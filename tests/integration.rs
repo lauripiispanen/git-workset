@@ -686,3 +686,57 @@ fn test_carve_with_excludes() {
         "assets should NOT exist with exclude"
     );
 }
+
+#[test]
+fn test_carve_reads_config_from_target_branch() {
+    // Verify that carve reads .git-workset.toml from the target branch,
+    // not from the current working tree. This matters when workset definitions
+    // differ between branches.
+    let (_dir, repo) = create_test_repo();
+
+    // Create a branch with a different config: "backend" now includes assets too
+    run_git_ok(&["checkout", "-b", "custom-config"], &repo);
+    let custom_config = r#"
+[workset.backend]
+description = "Backend with assets"
+include = ["src/server", "src/shared", "assets"]
+
+[workset.backend.submodules]
+skip = ["ext/lib"]
+"#;
+    std::fs::write(repo.join(".git-workset.toml"), custom_config).unwrap();
+    run_git_ok(&["add", ".git-workset.toml"], &repo);
+    run_git_ok(&["commit", "-m", "update config on custom branch"], &repo);
+
+    // Go back to main — its config does NOT include assets in "backend"
+    run_git_ok(&["checkout", "main"], &repo);
+
+    // Carve from main, targeting the custom-config branch
+    let wt_path = _dir.path().join("wt-custom-cfg");
+    let output = run_workset(
+        &[
+            "carve",
+            wt_path.to_str().unwrap(),
+            "custom-config",
+            "-w",
+            "backend",
+        ],
+        &repo,
+    );
+    assert!(output.status.success(), "carve failed: {}", stderr(&output));
+
+    // The worktree should use custom-config's definition of "backend",
+    // which includes assets — NOT main's definition which excludes them.
+    assert!(
+        wt_path.join("src/server/hello.txt").exists(),
+        "src/server should exist"
+    );
+    assert!(
+        wt_path.join("src/shared/hello.txt").exists(),
+        "src/shared should exist"
+    );
+    assert!(
+        wt_path.join("assets/hello.txt").exists(),
+        "assets SHOULD exist — config was read from target branch"
+    );
+}
