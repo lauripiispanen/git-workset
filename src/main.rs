@@ -9,7 +9,11 @@ use std::process::Command;
 use config::WorksetsConfig;
 
 #[derive(Parser)]
-#[command(name = "git-workset", version, about = "Named sparse-checkout profiles for git worktrees")]
+#[command(
+    name = "git-workset",
+    version,
+    about = "Named sparse-checkout profiles for git worktrees"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -82,11 +86,22 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init => cmd_init(),
-        Commands::Clone { url, path, workset, branch, depth, shallow } => {
+        Commands::Clone {
+            url,
+            path,
+            workset,
+            branch,
+            depth,
+            shallow,
+        } => {
             let effective_depth = if shallow { Some(1) } else { depth };
             cmd_clone(&url, &path, &workset, branch.as_deref(), effective_depth)
         }
-        Commands::Carve { path, branch, workset } => cmd_carve(&path, &branch, &workset),
+        Commands::Carve {
+            path,
+            branch,
+            workset,
+        } => cmd_carve(&path, &branch, &workset),
         Commands::Sync => cmd_sync(),
         Commands::List => cmd_list(),
         Commands::Switch { name } => cmd_switch(&name),
@@ -113,7 +128,13 @@ fn cmd_init() -> Result<()> {
     Ok(())
 }
 
-fn cmd_clone(url: &str, path: &PathBuf, workset_name: &str, branch: Option<&str>, depth: Option<u32>) -> Result<()> {
+fn cmd_clone(
+    url: &str,
+    path: &PathBuf,
+    workset_name: &str,
+    branch: Option<&str>,
+    depth: Option<u32>,
+) -> Result<()> {
     let abs_path = if path.is_absolute() {
         path.clone()
     } else {
@@ -132,7 +153,11 @@ fn cmd_clone(url: &str, path: &PathBuf, workset_name: &str, branch: Option<&str>
         ));
         // Minimal fetch: just enough to read the config file
         let mut probe_args = vec![
-            "clone", "--depth", "1", "--no-checkout", "--filter=blob:none",
+            "clone",
+            "--depth",
+            "1",
+            "--no-checkout",
+            "--filter=blob:none",
         ];
         if let Some(b) = branch {
             probe_args.push("--branch");
@@ -193,7 +218,11 @@ fn cmd_carve(path: &PathBuf, branch: &str, workset_name: &str) -> Result<()> {
         std::env::current_dir()?.join(path)
     };
 
-    eprintln!("Creating worktree at {} on branch '{}'", abs_path.display(), branch);
+    eprintln!(
+        "Creating worktree at {} on branch '{}'",
+        abs_path.display(),
+        branch
+    );
     if let Some(desc) = &workset.description {
         eprintln!("Workset: {} ({})", workset_name, desc);
     }
@@ -259,12 +288,7 @@ fn cmd_list() -> Result<()> {
             .flatten()
             .unwrap_or_else(|| "-".to_string());
 
-        println!(
-            "{:<50} {:<25} [{}]",
-            path.display(),
-            branch,
-            workset,
-        );
+        println!("{:<50} {:<25} [{}]", path.display(), branch, workset,);
     }
 
     Ok(())

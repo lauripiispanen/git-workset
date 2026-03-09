@@ -25,10 +25,7 @@ pub fn find_repo_root() -> Result<PathBuf> {
     } else {
         // bare repo or worktree — resolve to absolute
         let abs = std::fs::canonicalize(&common_path)?;
-        Ok(abs
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or(abs))
+        Ok(abs.parent().map(|p| p.to_path_buf()).unwrap_or(abs))
     }
 }
 
@@ -60,7 +57,11 @@ fn run_git(args: &[&str], cwd: &Path) -> Result<()> {
         .status()
         .with_context(|| format!("Failed to run: git {}", display_args))?;
     if !status.success() {
-        bail!("git {} failed with exit code {:?}", display_args, status.code());
+        bail!(
+            "git {} failed with exit code {:?}",
+            display_args,
+            status.code()
+        );
     }
     Ok(())
 }
@@ -82,7 +83,13 @@ fn run_git_output(args: &[&str], cwd: &Path) -> Result<String> {
 /// files. This is much faster than clone → sparse → checkout because sparse
 /// checkout is configured before any checkout happens, so git never iterates
 /// the full tree through smudge filters.
-pub fn sparse_clone(url: &str, path: &Path, branch: Option<&str>, depth: Option<u32>, workset: &Workset) -> Result<()> {
+pub fn sparse_clone(
+    url: &str,
+    path: &Path,
+    branch: Option<&str>,
+    depth: Option<u32>,
+    workset: &Workset,
+) -> Result<()> {
     let path_str = path.to_str().context("Invalid path")?;
 
     // 1. git init
@@ -151,11 +158,13 @@ pub fn deepen(repo_path: &Path, depth: Option<u32>) -> Result<()> {
     }
 }
 
-
 /// Create a worktree, skipping LFS smudge.
 pub fn add_worktree(path: &Path, branch: &str) -> Result<()> {
     let path_str = path.to_str().context("Invalid path")?;
-    eprintln!("  GIT_LFS_SKIP_SMUDGE=1 git worktree add {} {}", path_str, branch);
+    eprintln!(
+        "  GIT_LFS_SKIP_SMUDGE=1 git worktree add {} {}",
+        path_str, branch
+    );
     let status = Command::new("git")
         .env("GIT_LFS_SKIP_SMUDGE", "1")
         .args(["worktree", "add", path_str, branch])
@@ -197,7 +206,12 @@ pub fn enable_worktree_config(worktree_path: &Path) -> Result<()> {
     // Override any global/repo submodule.recurse=true so that fetch only
     // recurses into active submodules, not all registered ones.
     run_git(
-        &["config", "--worktree", "fetch.recurseSubmodules", "on-demand"],
+        &[
+            "config",
+            "--worktree",
+            "fetch.recurseSubmodules",
+            "on-demand",
+        ],
         worktree_path,
     )?;
     run_git(
@@ -209,7 +223,13 @@ pub fn enable_worktree_config(worktree_path: &Path) -> Result<()> {
 /// Parse .gitmodules and return (name, path) pairs for all submodules.
 fn parse_submodule_entries(worktree_path: &Path) -> Result<Vec<(String, String)>> {
     let output = run_git_output(
-        &["config", "--file", ".gitmodules", "--get-regexp", r"submodule\..*\.path"],
+        &[
+            "config",
+            "--file",
+            ".gitmodules",
+            "--get-regexp",
+            r"submodule\..*\.path",
+        ],
         worktree_path,
     )?;
 
@@ -236,7 +256,12 @@ pub fn init_submodules(worktree_path: &Path, workset: &Workset) -> Result<()> {
             // Mark as inactive in worktree-scoped config so git pull/fetch
             // won't try to access it
             run_git(
-                &["config", "--worktree", &format!("submodule.{}.active", name), "false"],
+                &[
+                    "config",
+                    "--worktree",
+                    &format!("submodule.{}.active", name),
+                    "false",
+                ],
                 worktree_path,
             )?;
         } else {
@@ -313,7 +338,10 @@ pub fn read_workset_name(worktree_path: &Path) -> Result<Option<String>> {
 
 /// List all worktrees with their paths and branches.
 pub fn list_worktrees() -> Result<Vec<(PathBuf, String)>> {
-    let output = run_git_output(&["worktree", "list", "--porcelain"], &std::env::current_dir()?)?;
+    let output = run_git_output(
+        &["worktree", "list", "--porcelain"],
+        &std::env::current_dir()?,
+    )?;
     let mut worktrees = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut current_branch = String::new();
@@ -350,4 +378,3 @@ pub fn remove_worktree(path: &Path) -> Result<()> {
     let path_str = path.to_str().context("Invalid path")?;
     run_git(&["worktree", "remove", path_str], &std::env::current_dir()?)
 }
-

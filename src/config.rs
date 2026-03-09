@@ -68,8 +68,8 @@ impl WorksetsConfig {
                 stderr.trim()
             );
         }
-        let content = String::from_utf8(output.stdout)
-            .context("Invalid UTF-8 in .git-workset.toml")?;
+        let content =
+            String::from_utf8(output.stdout).context("Invalid UTF-8 in .git-workset.toml")?;
         toml::from_str(&content).context("Failed to parse .git-workset.toml from git tree")
     }
 
@@ -78,18 +78,14 @@ impl WorksetsConfig {
         let names: Vec<&str> = name.split('+').collect();
 
         if names.len() == 1 {
-            return self
-                .workset
-                .get(name)
-                .cloned()
-                .with_context(|| {
-                    let available: Vec<&str> = self.workset.keys().map(|s| s.as_str()).collect();
-                    format!(
-                        "Workset '{}' not found. Available: {}",
-                        name,
-                        available.join(", ")
-                    )
-                });
+            return self.workset.get(name).cloned().with_context(|| {
+                let available: Vec<&str> = self.workset.keys().map(|s| s.as_str()).collect();
+                format!(
+                    "Workset '{}' not found. Available: {}",
+                    name,
+                    available.join(", ")
+                )
+            });
         }
 
         // Merge multiple worksets
@@ -129,10 +125,7 @@ impl WorksetsConfig {
                     }
                     // shallow is true if either wants it
                     m.submodules.shallow = m.submodules.shallow || ws.submodules.shallow;
-                    m.description = Some(format!(
-                        "Composite: {}",
-                        names.join("+")
-                    ));
+                    m.description = Some(format!("Composite: {}", names.join("+")));
                     m
                 }
             });
@@ -146,10 +139,7 @@ impl WorksetsConfig {
             "server".to_string(),
             Workset {
                 description: Some("Backend server development".to_string()),
-                include: vec![
-                    "src/server".to_string(),
-                    "src/shared".to_string(),
-                ],
+                include: vec!["src/server".to_string(), "src/shared".to_string()],
                 exclude_lfs: vec!["*.psd".to_string(), "*.fbx".to_string()],
                 include_lfs: vec!["*.json".to_string(), "*.toml".to_string()],
                 submodules: SubmoduleConfig {

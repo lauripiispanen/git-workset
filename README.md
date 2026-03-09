@@ -6,11 +6,27 @@ Create lightweight worktrees that only check out the directories you need, with 
 
 ## Install
 
+### Homebrew (macOS/Linux)
+
+```sh
+brew install lauripiispanen/tap/git-workset
+```
+
+This uses a [Homebrew tap](https://github.com/lauripiispanen/homebrew-tap). The formula template is in `Formula/git-workset.rb` in this repo.
+
+### Pre-built binaries
+
+Download the latest release from [GitHub Releases](https://github.com/lauripiispanen/git-workset/releases), extract the archive, and place `git-workset` somewhere on your `PATH`.
+
+### From source
+
 ```sh
 cargo install --path .
 ```
 
-This installs a `git-workset` binary. Git automatically discovers it as a subcommand, so you can use `git workset` directly.
+---
+
+Once installed, git automatically discovers `git-workset` as a subcommand, so you can use `git workset` directly.
 
 ## Quick start
 
