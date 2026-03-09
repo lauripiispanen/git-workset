@@ -14,7 +14,11 @@ pub struct Workset {
     #[serde(default)]
     pub description: Option<String>,
     /// Directories to include in sparse checkout
+    #[serde(default)]
     pub include: Vec<String>,
+    /// Directories to exclude from sparse checkout (forces --no-cone mode)
+    #[serde(default)]
+    pub exclude: Vec<String>,
     /// LFS patterns to exclude from download
     #[serde(default)]
     pub exclude_lfs: Vec<String>,
@@ -105,6 +109,12 @@ impl WorksetsConfig {
                             m.include.push(dir.clone());
                         }
                     }
+                    // Union excludes
+                    for dir in &ws.exclude {
+                        if !m.exclude.contains(dir) {
+                            m.exclude.push(dir.clone());
+                        }
+                    }
                     // Union LFS includes
                     for pat in &ws.include_lfs {
                         if !m.include_lfs.contains(pat) {
@@ -139,7 +149,8 @@ impl WorksetsConfig {
             "all".to_string(),
             Workset {
                 description: Some("Everything".to_string()),
-                include: vec!["*".to_string()],
+                include: vec![],
+                exclude: vec![],
                 exclude_lfs: vec![],
                 include_lfs: vec![],
                 submodules: SubmoduleConfig {

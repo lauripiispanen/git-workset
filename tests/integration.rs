@@ -111,8 +111,16 @@ include = ["src/client", "src/shared"]
 skip = ["ext/lib"]
 
 [workset.all]
-description = "Everything"
+description = "Everything (explicit)"
 include = ["src/server", "src/client", "src/shared", "assets", "ext"]
+
+[workset.everything]
+description = "Everything (empty includes = no sparse checkout)"
+include = []
+
+[workset.no-assets]
+description = "Everything except assets"
+exclude = ["assets"]
 "#;
     std::fs::write(repo.join(".git-workset.toml"), config).unwrap();
 
@@ -563,5 +571,118 @@ fn test_switch_nonexistent_workset() {
         stderr(&output).contains("not found"),
         "error should mention 'not found': {}",
         stderr(&output)
+    );
+}
+
+#[test]
+fn test_init_and_carve_default_workset() {
+    // Tests that `init` creates a config whose "all" workset actually works
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    run_git_ok(&["init", "--initial-branch=main"], &repo);
+    run_git_ok(&["config", "user.email", "test@test.com"], &repo);
+    run_git_ok(&["config", "user.name", "Test"], &repo);
+
+    // Create some content and commit
+    let src = repo.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("main.rs"), "fn main() {}").unwrap();
+    run_git_ok(&["add", "-A"], &repo);
+    run_git_ok(&["commit", "-m", "initial"], &repo);
+
+    // Run init to generate the default config
+    let output = run_workset(&["init"], &repo);
+    assert!(output.status.success(), "init failed: {}", stderr(&output));
+    run_git_ok(&["add", ".git-workset.toml"], &repo);
+    run_git_ok(&["commit", "-m", "add workset config"], &repo);
+
+    // Carve a worktree with the default "all" workset
+    run_git_ok(&["branch", "test-all"], &repo);
+    let wt_path = dir.path().join("wt-all");
+    let output = run_workset(
+        &["carve", wt_path.to_str().unwrap(), "test-all", "-w", "all"],
+        &repo,
+    );
+    assert!(
+        output.status.success(),
+        "carve with default 'all' workset failed: {}",
+        stderr(&output)
+    );
+
+    // Everything should be checked out
+    assert!(
+        wt_path.join("src/main.rs").exists(),
+        "src/main.rs should exist in 'all' workset"
+    );
+}
+
+#[test]
+fn test_carve_empty_includes_gets_full_tree() {
+    let (_dir, repo) = create_test_repo();
+    run_git_ok(&["branch", "everything-test"], &repo);
+
+    let wt_path = _dir.path().join("wt-everything");
+    let output = run_workset(
+        &[
+            "carve",
+            wt_path.to_str().unwrap(),
+            "everything-test",
+            "-w",
+            "everything",
+        ],
+        &repo,
+    );
+    assert!(
+        output.status.success(),
+        "carve with empty includes failed: {}",
+        stderr(&output)
+    );
+
+    // All directories should be present since sparse checkout is disabled
+    assert!(wt_path.join("src/server/hello.txt").exists());
+    assert!(wt_path.join("src/client/hello.txt").exists());
+    assert!(wt_path.join("src/shared/hello.txt").exists());
+    assert!(wt_path.join("assets/hello.txt").exists());
+}
+
+#[test]
+fn test_carve_with_excludes() {
+    let (_dir, repo) = create_test_repo();
+    run_git_ok(&["branch", "exclude-test"], &repo);
+
+    let wt_path = _dir.path().join("wt-exclude");
+    let output = run_workset(
+        &[
+            "carve",
+            wt_path.to_str().unwrap(),
+            "exclude-test",
+            "-w",
+            "no-assets",
+        ],
+        &repo,
+    );
+    assert!(
+        output.status.success(),
+        "carve with excludes failed: {}",
+        stderr(&output)
+    );
+
+    // Everything except assets should be present
+    assert!(
+        wt_path.join("src/server/hello.txt").exists(),
+        "src/server should exist"
+    );
+    assert!(
+        wt_path.join("src/client/hello.txt").exists(),
+        "src/client should exist"
+    );
+    assert!(
+        wt_path.join("src/shared/hello.txt").exists(),
+        "src/shared should exist"
+    );
+    assert!(
+        !wt_path.join("assets/hello.txt").exists(),
+        "assets should NOT exist with exclude"
     );
 }
