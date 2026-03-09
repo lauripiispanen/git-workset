@@ -15,12 +15,18 @@ This installs a `git-workset` binary. Git automatically discovers it as a subcom
 ## Quick start
 
 ```sh
-# In your repo root, create a config template
+# Clone a repo with only the files you need — no full checkout
+git workset clone git@github.com:org/repo.git ./repo --workset server
+
+# Clone with minimal history too
+git workset clone git@github.com:org/repo.git ./repo --workset server --shallow
+
+# Or if you already have a repo, create a config template
 git workset init
 
 # Edit .git-workset.toml to define your profiles (see below)
 
-# Create a worktree with a profile applied
+# Carve a lightweight worktree from an existing repo
 git workset carve ../feature-branch feature-branch --workset server
 
 # Compose multiple profiles
@@ -73,6 +79,17 @@ shallow = false
 
 ## Commands
 
+### `git workset clone <url> <path> --workset <name>`
+
+Clones a repo from scratch with only the workset's files. Sparse checkout is configured *before* the first checkout, so git never iterates the full tree through smudge filters — this matters in large repos with tens of thousands of files.
+
+The flow: probes the remote for `.git-workset.toml`, then does `git init` → sparse checkout → `git fetch` → `git checkout` so only workset files are ever materialized.
+
+Options:
+- `--branch <branch>` — branch to clone (default: remote HEAD)
+- `--shallow` — clone with depth 1 (minimal history)
+- `--depth <n>` — clone with specific history depth
+
 ### `git workset init`
 
 Creates a `.git-workset.toml` template in the current repo.
@@ -105,10 +122,15 @@ Shows all worktrees and their active workset profiles.
 
 Removes a worktree.
 
+### `git workset deepen [--by <n>]`
+
+Fetches more history for a shallow clone. Useful when you need `git blame` or `git log` beyond the shallow depth. Omit `--by` to fetch full history.
+
 ## How it works
 
 Under the hood, `git workset` orchestrates standard git primitives:
 
+- **Sparse clone** (`git init` → `sparse-checkout` → `fetch` → `checkout`) — configures sparse checkout before any checkout happens, avoiding full-tree iteration through smudge filters
 - **Sparse checkout** (`git sparse-checkout`) — each worktree gets its own sparse-checkout config
 - **Worktree-scoped config** (`git config --worktree`) — all settings (LFS filters, submodule active flags) are isolated per-worktree so the main repo is unaffected
 - **Shallow submodules** (`git submodule update --depth 1`) — just the pinned commit, no history; skipped submodules are marked `active=false` so `git fetch` won't try to access them

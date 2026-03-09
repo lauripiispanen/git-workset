@@ -78,6 +78,80 @@ fn run_git_output(args: &[&str], cwd: &Path) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
+/// Clone via init → sparse → fetch → checkout to avoid processing excluded
+/// files. This is much faster than clone → sparse → checkout because sparse
+/// checkout is configured before any checkout happens, so git never iterates
+/// the full tree through smudge filters.
+pub fn sparse_clone(url: &str, path: &Path, branch: Option<&str>, depth: Option<u32>, workset: &Workset) -> Result<()> {
+    let path_str = path.to_str().context("Invalid path")?;
+
+    // 1. git init
+    run_git(&["init", path_str], &std::env::current_dir()?)?;
+
+    // 2. Add remote
+    run_git(&["remote", "add", "origin", url], path)?;
+
+    // 3. Configure sparse checkout BEFORE any fetch/checkout
+    if workset.sparse_cone {
+        run_git(&["sparse-checkout", "init", "--cone"], path)?;
+    } else {
+        run_git(&["sparse-checkout", "init"], path)?;
+    }
+
+    let mut sparse_args: Vec<&str> = vec!["sparse-checkout", "set"];
+    let includes: Vec<&str> = workset.include.iter().map(|s| s.as_str()).collect();
+    sparse_args.extend(&includes);
+    if !workset.sparse_cone {
+        sparse_args.push("--no-cone");
+    }
+    run_git(&sparse_args, path)?;
+
+    // 4. Fetch (optionally shallow)
+    let depth_str;
+    let mut fetch_args = vec!["fetch"];
+    if let Some(d) = depth {
+        depth_str = d.to_string();
+        fetch_args.push("--depth");
+        fetch_args.push(&depth_str);
+    }
+    let refspec = branch.unwrap_or("HEAD");
+    fetch_args.push("origin");
+    fetch_args.push(refspec);
+
+    let fetch_status = Command::new("git")
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .args(&fetch_args)
+        .current_dir(path)
+        .status()
+        .context("Failed to fetch")?;
+    if !fetch_status.success() {
+        bail!("git fetch failed");
+    }
+
+    // 5. Set up branch tracking and checkout
+    if let Some(b) = branch {
+        // Create local branch tracking the remote
+        let remote_ref = format!("origin/{}", b);
+        run_git(&["checkout", "-b", b, &remote_ref], path)?;
+    } else {
+        run_git(&["checkout", "FETCH_HEAD"], path)?;
+    }
+
+    Ok(())
+}
+
+/// Deepen a shallow clone or fully unshallow it.
+pub fn deepen(repo_path: &Path, depth: Option<u32>) -> Result<()> {
+    match depth {
+        Some(n) => {
+            let n_str = n.to_string();
+            run_git(&["fetch", "--deepen", &n_str], repo_path)
+        }
+        None => run_git(&["fetch", "--unshallow"], repo_path),
+    }
+}
+
+
 /// Create a worktree, skipping LFS smudge.
 pub fn add_worktree(path: &Path, branch: &str) -> Result<()> {
     let path_str = path.to_str().context("Invalid path")?;
