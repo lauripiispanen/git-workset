@@ -142,12 +142,8 @@ fn test_init_creates_config() {
 
     let content = std::fs::read_to_string(&config_path).unwrap();
     assert!(
-        content.contains("[workset.server]"),
-        "template should contain [workset.server]"
-    );
-    assert!(
-        content.contains("[workset.client]"),
-        "template should contain [workset.client]"
+        content.contains("[workset.all]"),
+        "template should contain [workset.all]"
     );
 }
 

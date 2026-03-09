@@ -136,30 +136,12 @@ impl WorksetsConfig {
     pub fn template() -> Self {
         let mut worksets = BTreeMap::new();
         worksets.insert(
-            "server".to_string(),
+            "all".to_string(),
             Workset {
-                description: Some("Backend server development".to_string()),
-                include: vec!["src/server".to_string(), "src/shared".to_string()],
-                exclude_lfs: vec!["*.psd".to_string(), "*.fbx".to_string()],
-                include_lfs: vec!["*.json".to_string(), "*.toml".to_string()],
-                submodules: SubmoduleConfig {
-                    shallow: true,
-                    skip: vec!["third_party/art-pipeline".to_string()],
-                },
-                sparse_cone: true,
-            },
-        );
-        worksets.insert(
-            "client".to_string(),
-            Workset {
-                description: Some("Game client work".to_string()),
-                include: vec![
-                    "src/client".to_string(),
-                    "src/shared".to_string(),
-                    "src/rendering".to_string(),
-                ],
+                description: Some("Everything".to_string()),
+                include: vec!["*".to_string()],
                 exclude_lfs: vec![],
-                include_lfs: vec!["*.png".to_string(), "*.atlas".to_string()],
+                include_lfs: vec![],
                 submodules: SubmoduleConfig {
                     shallow: true,
                     skip: vec![],
