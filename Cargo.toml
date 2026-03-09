@@ -1,6 +1,6 @@
 [package]
 name = "git-workset"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Named sparse-checkout profiles for git worktrees with submodule and LFS management"
 
