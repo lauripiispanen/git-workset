@@ -8,6 +8,15 @@ cargo clippy -- -D warnings
 cargo test
 ```
 
+## After changing CLI interface
+
+- Update README.md command docs and examples to match
+- Add or update integration tests in `tests/integration.rs`
+
+## Commit messages
+
+Release notes are auto-generated from commit subjects between tags. Write clear, meaningful commit messages — they become user-facing release notes. Prefix internal changes (CI, tooling, docs-only) with `chore:` to exclude them from release notes.
+
 ## Release flow
 
 1. Bump `version` in `Cargo.toml`
