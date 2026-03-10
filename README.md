@@ -42,11 +42,14 @@ git workset init
 
 # Edit .git-workset.toml to define your profiles (see below)
 
-# Carve a lightweight worktree from an existing repo
+# Carve a lightweight worktree with a new branch
+git workset carve ../feature-branch -b feature-branch --workset server
+
+# Carve from an existing branch
 git workset carve ../feature-branch feature-branch --workset server
 
 # Compose multiple profiles
-git workset carve ../fix main --workset server+art
+git workset carve ../fix -b fix main --workset server+art
 ```
 
 ## Configuration
@@ -86,7 +89,8 @@ shallow = false
 | Field | Default | Description |
 |-------|---------|-------------|
 | `description` | — | Human-readable profile description |
-| `include` | — | Directories to include in sparse checkout |
+| `include` | `[]` | Directories to include in sparse checkout (empty = full tree) |
+| `exclude` | `[]` | Directories to exclude from sparse checkout (forces `--no-cone` mode) |
 | `exclude_lfs` | `[]` | LFS patterns to skip downloading |
 | `include_lfs` | `[]` | LFS patterns to download (if set, only these are fetched) |
 | `sparse_cone` | `true` | Use cone mode for sparse checkout (faster, directory-based) |
@@ -110,7 +114,7 @@ Options:
 
 Creates a `.git-workset.toml` template in the current repo.
 
-### `git workset carve <path> <branch> --workset <name>`
+### `git workset carve <path> [<commit-ish>] --workset <name>`
 
 Creates a new worktree and applies a workset profile. This:
 
@@ -121,6 +125,30 @@ Creates a new worktree and applies a workset profile. This:
 5. Configures LFS filters and pulls only matching files
 
 Use `+` to compose profiles: `--workset server+art` unions both profiles.
+
+Options:
+- `-b <name>` — create a new branch (fails if it already exists)
+- `-B <name>` — create or reset a branch (force-creates even if it exists)
+- `<commit-ish>` — the branch/commit to check out, or the start point when used with `-b`/`-B` (default: HEAD)
+
+If neither `-b`/`-B` nor `<commit-ish>` is given, git auto-creates a branch named after the path basename.
+
+```sh
+# New branch from HEAD
+git workset carve ../my-feature -b my-feature --workset server
+
+# New branch from a specific commit
+git workset carve ../hotfix -b hotfix v2.0 --workset server
+
+# Check out an existing branch
+git workset carve ../my-feature existing-branch --workset server
+
+# Auto-name the branch after the directory ("my-feature")
+git workset carve ../my-feature --workset server
+
+# Force-reset an existing branch to HEAD
+git workset carve ../retry -B stale-branch --workset server
+```
 
 ### `git workset sync`
 

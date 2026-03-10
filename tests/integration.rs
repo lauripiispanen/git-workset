@@ -740,3 +740,171 @@ skip = ["ext/lib"]
         "assets SHOULD exist — config was read from target branch"
     );
 }
+
+#[test]
+fn test_carve_with_new_branch_flag() {
+    let (_dir, repo) = create_test_repo();
+
+    let wt_path = _dir.path().join("wt-new-branch");
+    let output = run_workset(
+        &[
+            "carve",
+            wt_path.to_str().unwrap(),
+            "-b",
+            "feature/new-thing",
+            "-w",
+            "backend",
+        ],
+        &repo,
+    );
+    assert!(
+        output.status.success(),
+        "carve with -b failed: {}",
+        stderr(&output)
+    );
+
+    // The worktree should exist with sparse checkout applied
+    assert!(
+        wt_path.join("src/server/hello.txt").exists(),
+        "src/server should be checked out"
+    );
+    assert!(
+        !wt_path.join("src/client/hello.txt").exists(),
+        "src/client should NOT be checked out in backend workset"
+    );
+
+    // The branch should be "feature/new-thing"
+    let output = run_git(&["branch", "--show-current"], &wt_path);
+    let branch = stdout(&output).trim().to_string();
+    assert_eq!(
+        branch, "feature/new-thing",
+        "worktree should be on the new branch"
+    );
+}
+
+#[test]
+fn test_carve_with_new_branch_from_commit() {
+    let (_dir, repo) = create_test_repo();
+
+    // Add a second commit so we have two distinct points
+    std::fs::write(repo.join("src/server/extra.txt"), "extra").unwrap();
+    run_git_ok(&["add", "-A"], &repo);
+    run_git_ok(&["commit", "-m", "second commit"], &repo);
+
+    // Get the first commit SHA
+    let output = run_git(&["rev-parse", "HEAD~1"], &repo);
+    let first_commit = stdout(&output).trim().to_string();
+
+    let wt_path = _dir.path().join("wt-from-commit");
+    let output = run_workset(
+        &[
+            "carve",
+            wt_path.to_str().unwrap(),
+            "-b",
+            "feature/from-old",
+            &first_commit,
+            "-w",
+            "backend",
+        ],
+        &repo,
+    );
+    assert!(
+        output.status.success(),
+        "carve with -b <commit> failed: {}",
+        stderr(&output)
+    );
+
+    // Should be on the new branch
+    let output = run_git(&["branch", "--show-current"], &wt_path);
+    let branch = stdout(&output).trim().to_string();
+    assert_eq!(branch, "feature/from-old");
+
+    // Should be at the first commit (no extra.txt in src/server)
+    assert!(
+        !wt_path.join("src/server/extra.txt").exists(),
+        "extra.txt should NOT exist — branched from first commit"
+    );
+}
+
+#[test]
+fn test_carve_with_force_branch_flag() {
+    let (_dir, repo) = create_test_repo();
+
+    // Create a branch that already exists
+    run_git_ok(&["branch", "existing-branch"], &repo);
+
+    // Add another commit on main
+    std::fs::write(repo.join("src/server/new.txt"), "new content").unwrap();
+    run_git_ok(&["add", "-A"], &repo);
+    run_git_ok(&["commit", "-m", "newer commit"], &repo);
+
+    let wt_path = _dir.path().join("wt-force-branch");
+    // -b should fail because the branch already exists
+    let output = run_workset(
+        &[
+            "carve",
+            wt_path.to_str().unwrap(),
+            "-b",
+            "existing-branch",
+            "-w",
+            "backend",
+        ],
+        &repo,
+    );
+    assert!(
+        !output.status.success(),
+        "carve with -b should fail for existing branch"
+    );
+
+    // -B should succeed and reset the branch to HEAD
+    let output = run_workset(
+        &[
+            "carve",
+            wt_path.to_str().unwrap(),
+            "-B",
+            "existing-branch",
+            "-w",
+            "backend",
+        ],
+        &repo,
+    );
+    assert!(
+        output.status.success(),
+        "carve with -B should succeed: {}",
+        stderr(&output)
+    );
+
+    // The branch should now point at the newer commit (has new.txt)
+    assert!(
+        wt_path.join("src/server/new.txt").exists(),
+        "new.txt should exist — branch was reset to HEAD"
+    );
+}
+
+#[test]
+fn test_carve_auto_branch_from_path() {
+    let (_dir, repo) = create_test_repo();
+
+    let wt_path = _dir.path().join("auto-branch-name");
+    let output = run_workset(
+        &["carve", wt_path.to_str().unwrap(), "-w", "backend"],
+        &repo,
+    );
+    assert!(
+        output.status.success(),
+        "carve without branch should auto-create: {}",
+        stderr(&output)
+    );
+
+    // Git should create a branch named after the path basename
+    let output = run_git(&["branch", "--show-current"], &wt_path);
+    let branch = stdout(&output).trim().to_string();
+    assert_eq!(
+        branch, "auto-branch-name",
+        "branch name should match path basename"
+    );
+
+    // Sparse checkout should still be applied
+    assert!(wt_path.join("src/server/hello.txt").exists());
+    assert!(!wt_path.join("src/client/hello.txt").exists());
+}

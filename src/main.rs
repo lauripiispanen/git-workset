@@ -48,11 +48,17 @@ enum Commands {
     Carve {
         /// Path for the new worktree
         path: PathBuf,
-        /// Branch to check out
-        branch: String,
+        /// Branch or commit to check out (default: basename of path)
+        commit_ish: Option<String>,
         /// Workset profile name (use "a+b" to compose multiple)
         #[arg(short, long)]
         workset: String,
+        /// Create a new branch with the given name
+        #[arg(short = 'b', conflicts_with = "force_branch")]
+        new_branch: Option<String>,
+        /// Create or reset a branch with the given name
+        #[arg(short = 'B', conflicts_with = "new_branch")]
+        force_branch: Option<String>,
     },
 
     /// Re-apply the active workset profile to the current worktree
@@ -99,9 +105,17 @@ fn main() -> Result<()> {
         }
         Commands::Carve {
             path,
-            branch,
+            commit_ish,
             workset,
-        } => cmd_carve(&path, &branch, &workset),
+            new_branch,
+            force_branch,
+        } => cmd_carve(
+            &path,
+            commit_ish.as_deref(),
+            &workset,
+            new_branch,
+            force_branch,
+        ),
         Commands::Sync => cmd_sync(),
         Commands::List => cmd_list(),
         Commands::Switch { name } => cmd_switch(&name),
@@ -207,9 +221,21 @@ fn cmd_clone(
     Ok(())
 }
 
-fn cmd_carve(path: &PathBuf, branch: &str, workset_name: &str) -> Result<()> {
+fn cmd_carve(
+    path: &PathBuf,
+    commit_ish: Option<&str>,
+    workset_name: &str,
+    new_branch: Option<String>,
+    force_branch: Option<String>,
+) -> Result<()> {
     let repo_root = git::find_repo_root()?;
-    let config = WorksetsConfig::load_from_git(&repo_root, branch)?;
+
+    // Determine which ref to read the config from:
+    // - explicit commit-ish if given
+    // - the existing branch (when no -b/-B)
+    // - HEAD (when -b/-B without commit-ish)
+    let config_ref = commit_ish.unwrap_or("HEAD");
+    let config = WorksetsConfig::load_from_git(&repo_root, config_ref)?;
     let workset = config.get_workset(workset_name)?;
 
     let abs_path = if path.is_absolute() {
@@ -218,17 +244,42 @@ fn cmd_carve(path: &PathBuf, branch: &str, workset_name: &str) -> Result<()> {
         std::env::current_dir()?.join(path)
     };
 
+    // Build the branch description for the status message
+    let branch_desc = if let Some(ref b) = new_branch {
+        format!("new branch '{}' from {}", b, config_ref)
+    } else if let Some(ref b) = force_branch {
+        format!("branch '{}' (reset to {})", b, config_ref)
+    } else if let Some(c) = commit_ish {
+        format!("branch '{}'", c)
+    } else {
+        let basename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        format!("new branch '{}' from HEAD", basename)
+    };
+
     eprintln!(
-        "Creating worktree at {} on branch '{}'",
+        "Creating worktree at {} on {}",
         abs_path.display(),
-        branch
+        branch_desc
     );
     if let Some(desc) = &workset.description {
         eprintln!("Workset: {} ({})", workset_name, desc);
     }
 
     // 1. Create worktree with LFS smudge skipped
-    git::add_worktree(&abs_path, branch)?;
+    let branch_mode = if let Some(ref b) = new_branch {
+        git::WorktreeBranch::Create(b.clone())
+    } else if let Some(ref b) = force_branch {
+        git::WorktreeBranch::ForceCreate(b.clone())
+    } else {
+        match commit_ish {
+            Some(c) => git::WorktreeBranch::Existing(c.to_string()),
+            None => git::WorktreeBranch::Auto,
+        }
+    };
+    git::add_worktree(&abs_path, branch_mode, commit_ish)?;
 
     // 2. Enable worktree-scoped config so LFS and submodule settings
     //    don't leak into the main repo's .git/config

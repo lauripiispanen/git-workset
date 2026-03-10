@@ -169,16 +169,54 @@ pub fn deepen(repo_path: &Path, depth: Option<u32>) -> Result<()> {
     }
 }
 
+/// How to handle branch creation when adding a worktree.
+pub enum WorktreeBranch {
+    /// Check out an existing branch or commit.
+    Existing(String),
+    /// Create a new branch (`-b`).
+    Create(String),
+    /// Create or reset a branch (`-B`).
+    ForceCreate(String),
+    /// Let git decide (default: new branch named after the path basename).
+    Auto,
+}
+
 /// Create a worktree, skipping LFS smudge.
-pub fn add_worktree(path: &Path, branch: &str) -> Result<()> {
+pub fn add_worktree(path: &Path, branch: WorktreeBranch, commit_ish: Option<&str>) -> Result<()> {
     let path_str = path.to_str().context("Invalid path")?;
-    eprintln!(
-        "  GIT_LFS_SKIP_SMUDGE=1 git worktree add {} {}",
-        path_str, branch
-    );
+
+    let mut args: Vec<String> = vec!["worktree".into(), "add".into()];
+
+    match &branch {
+        WorktreeBranch::Create(name) => {
+            args.push("-b".into());
+            args.push(name.clone());
+        }
+        WorktreeBranch::ForceCreate(name) => {
+            args.push("-B".into());
+            args.push(name.clone());
+        }
+        _ => {}
+    }
+
+    args.push(path_str.into());
+
+    match &branch {
+        WorktreeBranch::Existing(b) => args.push(b.clone()),
+        WorktreeBranch::Create(_) | WorktreeBranch::ForceCreate(_) => {
+            if let Some(c) = commit_ish {
+                args.push(c.into());
+            }
+        }
+        WorktreeBranch::Auto => {}
+    }
+
+    let display_args = args.join(" ");
+    eprintln!("  GIT_LFS_SKIP_SMUDGE=1 git {}", display_args);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let status = Command::new("git")
         .env("GIT_LFS_SKIP_SMUDGE", "1")
-        .args(["worktree", "add", path_str, branch])
+        .args(&arg_refs)
         .status()
         .context("Failed to create worktree")?;
     if !status.success() {
