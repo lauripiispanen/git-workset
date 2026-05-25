@@ -178,3 +178,61 @@ jobs:
             artifacts/git-workset-*.tar.gz
             artifacts/git-workset-*.zip
             artifacts/git-workset-*.sha256
+
+  deploy-pages:
+    name: Deploy GitHub Pages
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stamp version into page
+        run: sed -i "s/__VERSION__/${{ github.ref_name }}/g" docs/index.html
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./docs
+          publish_branch: gh-pages
+
+  deploy-homebrew:
+    name: Update Homebrew Tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate and push formula
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          SHA_X86_DARWIN=$(awk '{print $1}' artifacts/git-workset-x86_64-apple-darwin.tar.gz.sha256)
+          SHA_ARM_DARWIN=$(awk '{print $1}' artifacts/git-workset-aarch64-apple-darwin.tar.gz.sha256)
+          SHA_X86_LINUX=$(awk '{print $1}' artifacts/git-workset-x86_64-unknown-linux-gnu.tar.gz.sha256)
+          SHA_ARM_LINUX=$(awk '{print $1}' artifacts/git-workset-aarch64-unknown-linux-gnu.tar.gz.sha256)
+
+          sed \
+            -e "s/VERSION_PLACEHOLDER/${VERSION}/" \
+            -e "s/SHA256_X86_DARWIN/${SHA_X86_DARWIN}/" \
+            -e "s/SHA256_ARM_DARWIN/${SHA_ARM_DARWIN}/" \
+            -e "s/SHA256_X86_LINUX/${SHA_X86_LINUX}/" \
+            -e "s/SHA256_ARM_LINUX/${SHA_ARM_LINUX}/" \
+            Formula/git-workset.rb > /tmp/git-workset.rb
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/lauripiispanen/homebrew-tap.git" /tmp/homebrew-tap
+          cp /tmp/git-workset.rb /tmp/homebrew-tap/Formula/git-workset.rb
+          cd /tmp/homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/git-workset.rb
+          git commit -m "chore: bump git-workset to ${TAG}"
+          git push
