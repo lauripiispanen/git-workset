@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>git-workset — Sparse-checkout profiles for git</title>
+  <meta name="description" content="Named sparse-checkout profiles for git worktrees. Give your team the partial-checkout workflow Perforce teams take for granted — without the migration.">
+  <link rel="canonical" href="https://lauripiispanen.github.io/git-workset/">
+
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://lauripiispanen.github.io/git-workset/">
+  <meta property="og:title" content="git-workset — Sparse-checkout profiles for git">
+  <meta property="og:description" content="Named sparse-checkout profiles for git worktrees. Keep git without switching to Perforce.">
+
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="git-workset — Sparse-checkout profiles for git">
+  <meta name="twitter:description" content="Named sparse-checkout profiles for git worktrees. Keep git without switching to Perforce.">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "git-workset",
+    "description": "Named sparse-checkout profiles for git worktrees",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "macOS, Linux, Windows",
+    "softwareVersion": "v0.2.0",
+    "license": "https://opensource.org/licenses/MIT",
+    "url": "https://lauripiispanen.github.io/git-workset/",
+    "downloadUrl": "https://github.com/lauripiispanen/git-workset/releases/latest",
+    "codeRepository": "https://github.com/lauripiispanen/git-workset"
+  }
+  </script>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;800&family=Barlow:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+  <style>
+    :root {
+      --bg:           #0c0c10;
+      --bg2:          #101016;
+      --fg:           #e2e2ec;
+      --muted:        #64647a;
+      --accent:       #b8ff3f;
+      --accent-faint: rgba(184,255,63,0.10);
+      --code-bg:      #0f0f15;
+      --border:       #1a1a28;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: var(--bg);
+      color: var(--fg);
+      font-family: 'Barlow', sans-serif;
+      font-weight: 400;
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* grain overlay for depth */
+    body::after {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='300' height='300' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+      pointer-events: none;
+      z-index: 9999;
+      opacity: 0.55;
+    }
+
+    .container {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 0 2rem;
+    }
+
+    /* ── HEADER ───────────────────────── */
+    header {
+      padding: 5rem 0 5.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .eyebrow {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.7rem;
+      font-weight: 500;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 2rem;
+      opacity: 0;
+      animation: rise 0.45s ease 0.05s forwards;
+    }
+
+    h1 {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 800;
+      font-size: clamp(4.5rem, 12vw, 9rem);
+      line-height: 0.88;
+      text-transform: uppercase;
+      letter-spacing: -0.025em;
+      max-width: 13ch;
+      opacity: 0;
+      animation: rise 0.5s ease 0.15s forwards;
+    }
+
+    h1 em {
+      font-style: normal;
+      color: var(--accent);
+      display: block;
+    }
+
+    .hero-sub {
+      margin-top: 2rem;
+      font-size: clamp(0.95rem, 1.7vw, 1.1rem);
+      color: var(--muted);
+      max-width: 50ch;
+      line-height: 1.75;
+      opacity: 0;
+      animation: rise 0.5s ease 0.3s forwards;
+    }
+
+    .hero-install {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.65rem;
+      margin-top: 2.5rem;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      padding: 0.75rem 1.25rem 0.75rem 1rem;
+      border-radius: 2px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      color: var(--accent);
+      opacity: 0;
+      animation: rise 0.5s ease 0.45s forwards;
+    }
+
+    .hero-install .prompt { color: var(--muted); user-select: none; }
+
+    .hero-links {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      margin-top: 1.5rem;
+      opacity: 0;
+      animation: rise 0.5s ease 0.6s forwards;
+    }
+
+    .btn {
+      display: inline-block;
+      padding: 0.6rem 1.2rem;
+      border-radius: 2px;
+      text-decoration: none;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      font-weight: 500;
+      letter-spacing: 0.04em;
+      transition: opacity 0.15s;
+    }
+    .btn:hover { opacity: 0.75; }
+    .btn-primary  { background: var(--accent); color: #0c0c10; }
+    .btn-ghost    { border: 1px solid var(--border); color: var(--muted); }
+    .btn-ghost:hover { color: var(--fg); border-color: #3a3a50; }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(10px); }
+      to   { opacity: 1; transform: none; }
+    }
+
+    /* ── SECTIONS ─────────────────────── */
+    section { padding: 4.5rem 0; border-top: 1px solid var(--border); }
+
+    h2 {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 800;
+      font-size: clamp(2.2rem, 5vw, 3.2rem);
+      text-transform: uppercase;
+      letter-spacing: -0.015em;
+      line-height: 1;
+      margin-bottom: 0.5rem;
+    }
+
+    .section-lead {
+      color: var(--muted);
+      font-size: 1rem;
+      max-width: 54ch;
+      margin-bottom: 2.5rem;
+      line-height: 1.7;
+    }
+
+    /* ── AUDIENCES ────────────────────── */
+    .audiences {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1px;
+      background: var(--border);
+      border: 1px solid var(--border);
+    }
+    @media (max-width: 740px) { .audiences { grid-template-columns: 1fr; } }
+
+    .audience {
+      background: var(--bg);
+      padding: 2rem;
+      transition: background 0.2s;
+    }
+    .audience:hover { background: var(--bg2); }
+
+    .audience-tag {
+      display: inline-block;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.62rem;
+      font-weight: 500;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--accent);
+      border: 1px solid rgba(184,255,63,0.28);
+      padding: 0.18rem 0.55rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .audience h3 {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 700;
+      font-size: 1.2rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      margin-bottom: 0.75rem;
+      line-height: 1.15;
+    }
+
+    .audience p {
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.75;
+    }
+
+    /* ── CODE PANELS ──────────────────── */
+    .code-grid {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 1px;
+      background: var(--border);
+      border: 1px solid var(--border);
+    }
+    @media (max-width: 700px) { .code-grid { grid-template-columns: 1fr; } }
+
+    .code-pane { background: var(--code-bg); overflow: hidden; }
+
+    .code-pane-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.65rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+
+    .code-pane-bar span {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.62rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .code-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--border);
+      flex-shrink: 0;
+    }
+    .code-dot.active { background: var(--accent); }
+
+    pre {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      line-height: 1.9;
+      padding: 1.5rem 1.25rem;
+      overflow-x: auto;
+      color: #7070a0;
+      margin: 0;
+    }
+
+    .t-key  { color: #b8ff3f; }
+    .t-str  { color: #79c9ff; }
+    .t-val  { color: #ffb86c; }
+    .t-cm   { color: #32324a; }
+    .t-cmd  { color: #b8ff3f; }
+    .t-hi   { color: #e2e2ec; }
+
+    code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82em;
+      color: var(--fg);
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      padding: 0.1em 0.35em;
+    }
+    pre code { background: none; border: none; padding: 0; font-size: 1em; color: inherit; }
+
+    /* ── BENEFITS ─────────────────────── */
+    .benefit {
+      display: grid;
+      grid-template-columns: 3.5rem 1fr;
+      gap: 2rem;
+      padding: 2.25rem 0;
+      border-bottom: 1px solid var(--border);
+      align-items: start;
+    }
+    .benefit:first-child { border-top: 1px solid var(--border); }
+
+    .benefit-n {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 800;
+      font-size: 2rem;
+      line-height: 1;
+      color: var(--border);
+      padding-top: 0.25rem;
+    }
+
+    .benefit h3 {
+      font-size: 1rem;
+      font-weight: 500;
+      color: var(--fg);
+      margin-bottom: 0.5rem;
+      line-height: 1.4;
+    }
+
+    .benefit p {
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.75;
+    }
+
+    /* ── INSTALL ──────────────────────── */
+    .install-list {
+      border: 1px solid var(--border);
+      margin-top: 2rem;
+    }
+
+    .install-item {
+      padding: 1.5rem 2rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .install-item:last-child { border-bottom: none; }
+
+    .install-item h3 {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.65rem;
+      font-weight: 400;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 0.75rem;
+    }
+
+    .install-item p { color: var(--muted); font-size: 0.9rem; }
+    .install-item a { color: var(--accent); text-decoration: none; }
+    .install-item a:hover { text-decoration: underline; }
+
+    .install-note {
+      margin-top: 1.25rem;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+
+    /* ── FOOTER ───────────────────────── */
+    footer { padding: 2rem 0; border-top: 1px solid var(--border); }
+
+    .footer-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+
+    .footer-id {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+    .footer-id b { color: var(--accent); font-weight: 500; }
+
+    .footer-nav { display: flex; gap: 1.5rem; }
+    .footer-nav a {
+      font-size: 0.8rem;
+      color: var(--muted);
+      text-decoration: none;
+    }
+    .footer-nav a:hover { color: var(--fg); }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="container">
+    <p class="eyebrow">git-workset &mdash; v0.2.0</p>
+    <h1>Keep git.<em>Drop the full checkout.</em></h1>
+    <p class="hero-sub">Named sparse-checkout profiles for git worktrees. The partial-checkout workflow Perforce teams have taken for granted for years &mdash; without switching platforms.</p>
+    <div class="hero-install">
+      <span class="prompt">$</span>brew install lauripiispanen/tap/git-workset
+    </div>
+    <div class="hero-links">
+      <a href="https://github.com/lauripiispanen/git-workset/releases/latest" class="btn btn-primary">Download v0.2.0</a>
+      <a href="https://github.com/lauripiispanen/git-workset" class="btn btn-ghost">GitHub &rarr;</a>
+    </div>
+  </div>
+</header>
+
+<main>
+
+  <section>
+    <div class="container">
+      <h2>Built for repos that got big</h2>
+      <p class="section-lead">Not everyone on the team needs every file. git-workset lets you define exactly who gets what &mdash; and enforces it with a single committed config.</p>
+      <div class="audiences">
+        <article class="audience">
+          <span class="audience-tag">Game studios</span>
+          <h3>Source&nbsp;+ assets in one repo</h3>
+          <p>Your rendering team shouldn&rsquo;t clone 80&nbsp;GB of source audio every morning. Define a <code>renderer</code> profile that skips LFS audio and motion-capture data. A 45-minute checkout becomes 5 minutes.</p>
+        </article>
+        <article class="audience">
+          <span class="audience-tag">Platform &amp; infra</span>
+          <h3>Monorepo without the slog</h3>
+          <p>Fifty services in one repo means fifty thousand files irrelevant to today&rsquo;s task. Carve a worktree scoped to your service, with shallow submodules and nothing else on disk.</p>
+        </article>
+        <article class="audience">
+          <span class="audience-tag">Teams on the fence</span>
+          <h3>No Perforce migration required</h3>
+          <p>Perforce&rsquo;s main draw for large teams is workspace-level file filters. git-workset brings that exact model to git. Your CI, IDE, hooks, and existing workflows stay completely unchanged.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="container">
+      <h2>One config file, one command</h2>
+      <p class="section-lead">Commit <code>.git-workset.toml</code> to the repo root. Everyone gets the same profiles &mdash; no scripts to share, no per-machine setup.</p>
+      <div class="code-grid">
+        <div class="code-pane">
+          <div class="code-pane-bar">
+            <div class="code-dot active"></div>
+            <span>.git-workset.toml</span>
+          </div>
+          <pre>[<span class="t-key">workset.server</span>]
+description = <span class="t-str">"Backend server work"</span>
+include     = <span class="t-str">["src/server", "src/shared"]</span>
+exclude_lfs = <span class="t-str">["*.psd", "*.fbx", "*.wav"]</span>
+sparse_cone = <span class="t-val">true</span>
+
+[<span class="t-key">workset.server.submodules</span>]
+shallow = <span class="t-val">true</span>
+skip    = <span class="t-str">["third_party/art-pipeline"]</span>
+
+[<span class="t-key">workset.art</span>]
+description  = <span class="t-str">"Full asset pipeline"</span>
+include      = <span class="t-str">["src/client", "assets"]</span>
+include_lfs  = <span class="t-str">["*.psd", "*.fbx"]</span></pre>
+        </div>
+        <div class="code-pane">
+          <div class="code-pane-bar">
+            <div class="code-dot active"></div>
+            <span>usage</span>
+          </div>
+          <pre><span class="t-cm"># Clone — server files only</span>
+<span class="t-cmd">git workset clone</span> git@github.com:org/repo.git \
+  ./repo <span class="t-hi">--workset server</span>
+
+<span class="t-cm"># New branch + scoped worktree</span>
+<span class="t-cmd">git workset carve</span> ../feature \
+  -b my-feature <span class="t-hi">--workset server</span>
+
+<span class="t-cm"># Compose profiles when you need both</span>
+<span class="t-cmd">git workset carve</span> ../fix \
+  -b fix main <span class="t-hi">--workset server+art</span></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="container">
+      <h2>Why it matters</h2>
+      <div>
+        <div class="benefit">
+          <span class="benefit-n">01</span>
+          <div>
+            <h3>Checkout time drops from hours to minutes</h3>
+            <p>Sparse cone combined with per-profile LFS filters means clones pull only what each workset actually needs. No waiting on gigabytes of assets unrelated to the task at hand.</p>
+          </div>
+        </div>
+        <div class="benefit">
+          <span class="benefit-n">02</span>
+          <div>
+            <h3>Profiles live in the repo, not in people&rsquo;s heads</h3>
+            <p>The <code>.git-workset.toml</code> is committed alongside the code. New engineers get the right workset on day one &mdash; no onboarding wiki page that&rsquo;s three years out of date, no &ldquo;ask someone&rdquo; step.</p>
+          </div>
+        </div>
+        <div class="benefit">
+          <span class="benefit-n">03</span>
+          <div>
+            <h3>It&rsquo;s git all the way down</h3>
+            <p>git-workset creates ordinary worktrees with sparse checkout and LFS filters applied. Your CI, IDE, git hooks, and scripts are unchanged. Nothing needs to learn about worksets except the engineers who want them.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="container">
+      <h2>Install</h2>
+      <div class="install-list">
+        <div class="install-item">
+          <h3>// Homebrew &mdash; macOS &amp; Linux</h3>
+          <pre>brew install lauripiispanen/tap/git-workset</pre>
+        </div>
+        <div class="install-item">
+          <h3>// Pre-built binary</h3>
+          <p>Download for macOS, Linux, or Windows from <a href="https://github.com/lauripiispanen/git-workset/releases/latest">GitHub Releases</a>. Extract and place on your <code>PATH</code>.</p>
+        </div>
+        <div class="install-item">
+          <h3>// From source</h3>
+          <pre>cargo install --git https://github.com/lauripiispanen/git-workset</pre>
+        </div>
+      </div>
+      <p class="install-note">git auto-discovers <code>git-workset</code> as a subcommand &mdash; use <code>git workset</code> directly once installed.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="container">
+    <div class="footer-row">
+      <p class="footer-id"><b>git-workset</b> v0.2.0 &middot; MIT License</p>
+      <nav class="footer-nav">
+        <a href="https://github.com/lauripiispanen/git-workset">GitHub</a>
+        <a href="https://github.com/lauripiispanen/git-workset/releases">Releases</a>
+        <a href="https://github.com/lauripiispanen/git-workset/issues">Issues</a>
+      </nav>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
