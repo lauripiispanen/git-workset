@@ -11,7 +11,23 @@ Follow these steps in order. Don't skip steps to "save time" — each one catche
 
 Make the changes per the agreed plan.
 
-## 2. Add integration tests
+## 2. Bump the version (when shipping user-visible changes)
+
+If the change will be user-visible — a new flag, a behavior change, a bug fix — bump `version` in `Cargo.toml` as part of **this same change**, before committing. This avoids the "deferred bump" trap where features pile up unreleased and someone later has to figure out the right version after-the-fact.
+
+Pick the smallest correct semver bump:
+
+| Change type | Bump | Example |
+|-------------|------|---------|
+| `feat:` (new functionality) | minor | `0.3.0 → 0.4.0` |
+| `fix:`/`perf:` (no API change) | patch | `0.3.1 → 0.3.2` |
+| Breaking change | major (pre-1.0: minor is OK, but call it out) | `0.3.0 → 0.4.0` |
+
+Skip the bump for `chore:`/`ci:`/`docs:`/`test:` changes — those don't ship to users.
+
+After editing `Cargo.toml`, run `cargo check` so `Cargo.lock` is regenerated to match. Stage both.
+
+## 3. Add integration tests
 
 Tests live in `tests/integration.rs`. They must be **substantive and actionable**:
 
@@ -21,7 +37,7 @@ Tests live in `tests/integration.rs`. They must be **substantive and actionable*
 - Cover the golden path AND at least one realistic failure mode (missing file, bad input, conflicting flags).
 - For CLI features, prefer end-to-end tests that invoke the binary, not unit tests of internal helpers.
 
-## 3. Run the full test suite
+## 4. Run the full test suite
 
 ```bash
 cargo test
@@ -29,7 +45,7 @@ cargo test
 
 All tests must pass. If a pre-existing test breaks, fix it — don't disable it.
 
-## 4. Lint and format
+## 5. Lint and format
 
 ```bash
 cargo clippy --all-targets --all-features -- -D warnings
@@ -38,9 +54,9 @@ cargo fmt --all -- --check
 
 Both must be clean. If `fmt --check` fails, run `cargo fmt --all` and re-run tests.
 
-## 5. Commit and push
+## 6. Commit and push
 
-Only after steps 2–4 are clean:
+Only after steps 3–5 are clean:
 
 ```bash
 git add <specific files>
@@ -50,7 +66,7 @@ git push origin main
 
 Use conventional commit prefixes (`feat:`, `fix:`, `chore:`, etc.) — match the style of recent commits in `git log`.
 
-## 6. Watch GitHub Actions
+## 7. Watch GitHub Actions
 
 Multi-platform CI must pass before the task is done.
 
@@ -67,12 +83,12 @@ gh run view <id> --log-failed   # if any job failed
 
 Do **not** declare the task complete until the run is green across all platforms.
 
-## 7. If CI fails
+## 8. If CI fails
 
 1. Read the failing job's logs (`gh run view <id> --log-failed`).
 2. Reproduce locally if possible.
 3. Fix the issue.
-4. Re-run steps 3–4 (tests + clippy + fmt) locally.
+4. Re-run steps 4–5 (tests + clippy + fmt) locally.
 5. **Amend the commit** (don't pile on fixup commits):
    ```bash
    git add <files>

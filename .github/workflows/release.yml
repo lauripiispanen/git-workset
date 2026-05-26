@@ -159,8 +159,8 @@ jobs:
           else
             RANGE="${{ github.ref_name }}"
           fi
-          # Build notes from commit subjects (skip version bump / tag commits)
-          NOTES=$(git log --pretty=format:"- %s" "$RANGE" --no-merges | grep -v -i "^- bump version\|^- v[0-9]\|^- chore" || true)
+          # Build notes from commit subjects (skip version bump / tag / internal commits)
+          NOTES=$(git log --pretty=format:"- %s" "$RANGE" --no-merges | grep -v -i "^- bump version\|^- v[0-9]\|^- chore\|^- ci\|^- docs\|^- test" || true)
           if [ -z "$NOTES" ]; then
             NOTES="Maintenance release."
           fi
