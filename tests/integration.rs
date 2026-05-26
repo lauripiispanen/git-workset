@@ -908,3 +908,237 @@ fn test_carve_auto_branch_from_path() {
     assert!(wt_path.join("src/server/hello.txt").exists());
     assert!(!wt_path.join("src/client/hello.txt").exists());
 }
+
+// ---- -f / --config flag tests ----
+
+#[test]
+fn test_carve_with_config_flag_overrides_committed() {
+    // The strongest possible test: an external file redefines a workset the
+    // committed config already defines. If the override works, we see files
+    // from the external definition; if it doesn't, we see files from the
+    // committed one.
+    let (dir, repo) = create_test_repo();
+    run_git_ok(&["branch", "override-test"], &repo);
+
+    // External config redefines `backend` to include `assets` only (not
+    // src/server or src/shared like the committed one).
+    let external_cfg = dir.path().join("external.toml");
+    std::fs::write(
+        &external_cfg,
+        r#"
+[workset.backend]
+description = "Override"
+include = ["assets"]
+
+[workset.backend.submodules]
+skip = ["ext/lib"]
+"#,
+    )
+    .unwrap();
+
+    let wt_path = dir.path().join("wt-override");
+    let output = run_workset(
+        &[
+            "-f",
+            external_cfg.to_str().unwrap(),
+            "carve",
+            wt_path.to_str().unwrap(),
+            "override-test",
+            "-w",
+            "backend",
+        ],
+        &repo,
+    );
+    assert!(
+        output.status.success(),
+        "carve -f failed: {}",
+        stderr(&output)
+    );
+
+    // External definition wins: assets present, src/server absent.
+    assert!(
+        wt_path.join("assets/hello.txt").exists(),
+        "assets/ should exist (from external config)"
+    );
+    assert!(
+        !wt_path.join("src/server/hello.txt").exists(),
+        "src/server should NOT exist — committed config must NOT have won"
+    );
+    assert!(
+        !wt_path.join("src/shared/hello.txt").exists(),
+        "src/shared should NOT exist — committed config must NOT have won"
+    );
+}
+
+#[test]
+fn test_sync_with_config_flag_changes_sparse_checkout() {
+    // Carve with the committed `backend` workset, then re-sync with an
+    // external config that redefines `backend`. The sparse checkout should
+    // visibly change.
+    let (dir, repo) = create_test_repo();
+    run_git_ok(&["branch", "sync-override", "main"], &repo);
+
+    let wt_path = dir.path().join("wt-sync-override");
+    let output = run_workset(
+        &[
+            "carve",
+            wt_path.to_str().unwrap(),
+            "sync-override",
+            "-w",
+            "backend",
+        ],
+        &repo,
+    );
+    assert!(output.status.success(), "carve failed: {}", stderr(&output));
+
+    // Baseline: committed backend → src/server present, assets absent.
+    assert!(wt_path.join("src/server/hello.txt").exists());
+    assert!(!wt_path.join("assets/hello.txt").exists());
+
+    // Redefine backend externally.
+    let external_cfg = dir.path().join("sync-external.toml");
+    std::fs::write(
+        &external_cfg,
+        r#"
+[workset.backend]
+description = "Override at sync"
+include = ["assets"]
+
+[workset.backend.submodules]
+skip = ["ext/lib"]
+"#,
+    )
+    .unwrap();
+
+    let output = run_workset(&["-f", external_cfg.to_str().unwrap(), "sync"], &wt_path);
+    assert!(
+        output.status.success(),
+        "sync -f failed: {}",
+        stderr(&output)
+    );
+
+    // After sync with override: assets present, src/server gone.
+    assert!(
+        wt_path.join("assets/hello.txt").exists(),
+        "assets/ should appear after sync with override"
+    );
+    assert!(
+        !wt_path.join("src/server/hello.txt").exists(),
+        "src/server should disappear after sync with override"
+    );
+}
+
+#[test]
+fn test_config_flag_missing_file_errors_cleanly() {
+    let (dir, repo) = create_test_repo();
+    run_git_ok(&["branch", "missing-cfg-test"], &repo);
+
+    let bogus = dir.path().join("does-not-exist.toml");
+    let wt_path = dir.path().join("wt-bogus");
+
+    let output = run_workset(
+        &[
+            "-f",
+            bogus.to_str().unwrap(),
+            "carve",
+            wt_path.to_str().unwrap(),
+            "missing-cfg-test",
+            "-w",
+            "backend",
+        ],
+        &repo,
+    );
+    assert!(
+        !output.status.success(),
+        "carve with missing -f file should fail"
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("does-not-exist.toml"),
+        "error should mention the missing path: {}",
+        err
+    );
+    assert!(
+        !wt_path.exists(),
+        "no worktree should have been created on config error"
+    );
+}
+
+#[test]
+fn test_clone_with_config_flag_works_on_repo_without_committed_config() {
+    // The headline use case: a repo that hasn't adopted worksets. The remote
+    // probe would find no .git-workset.toml; -f lets the user supply one.
+    let dir = TempDir::new().unwrap();
+    let origin = dir.path().join("origin-no-cfg");
+    std::fs::create_dir_all(&origin).unwrap();
+
+    run_git_ok(&["init", "--initial-branch=main"], &origin);
+    run_git_ok(&["config", "user.email", "test@test.com"], &origin);
+    run_git_ok(&["config", "user.name", "Test"], &origin);
+
+    for subdir in &["engine", "game-a", "game-b"] {
+        let p = origin.join(subdir);
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("file.txt"), format!("file in {}", subdir)).unwrap();
+    }
+    run_git_ok(&["add", "-A"], &origin);
+    run_git_ok(&["commit", "-m", "no worksets"], &origin);
+
+    // Make sure no .git-workset.toml is committed.
+    assert!(!origin.join(".git-workset.toml").exists());
+
+    // External config defining "engine-only".
+    let external_cfg = dir.path().join("my-personal-worksets.toml");
+    std::fs::write(
+        &external_cfg,
+        r#"
+[workset.engine-only]
+description = "Just the engine"
+include = ["engine"]
+"#,
+    )
+    .unwrap();
+
+    let repo_url = format!("file://{}", origin.display());
+    let clone_path = dir.path().join("cloned-no-cfg");
+
+    let output = run_workset(
+        &[
+            "-f",
+            external_cfg.to_str().unwrap(),
+            "clone",
+            &repo_url,
+            clone_path.to_str().unwrap(),
+            "-w",
+            "engine-only",
+            "-b",
+            "main",
+        ],
+        dir.path(),
+    );
+    assert!(
+        output.status.success(),
+        "clone -f against repo with no committed config failed: {}",
+        stderr(&output)
+    );
+
+    assert!(
+        clone_path.join("engine/file.txt").exists(),
+        "engine/ should be checked out from external workset"
+    );
+    assert!(
+        !clone_path.join("game-a/file.txt").exists(),
+        "game-a/ should NOT be checked out"
+    );
+    assert!(
+        !clone_path.join("game-b/file.txt").exists(),
+        "game-b/ should NOT be checked out"
+    );
+
+    // The clone should NOT have a probe-leftover directory next to it.
+    let probe_leftover = dir.path().join(".cloned-no-cfg-config-probe");
+    assert!(
+        !probe_leftover.exists(),
+        "probe leftover dir should not exist — -f should skip the probe"
+    );
+}

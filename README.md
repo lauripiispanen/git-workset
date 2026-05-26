@@ -99,6 +99,19 @@ shallow = false
 
 ## Commands
 
+### Using an external config (`-f` / `--config`)
+
+Every command below accepts a global `-f <path>` (or `--config <path>`) to read worksets from an external TOML file instead of the repo's committed `.git-workset.toml`. Useful when you work across many similar repos that haven't adopted worksets yet — keep a personal config and apply it everywhere:
+
+```bash
+git workset -f ~/worksets/unreal-engine.toml clone <url> game-a --workset engine-only
+git workset -f ~/worksets/unreal-engine.toml carve ../game-a-feature -w engine-only
+```
+
+When `-f` is set and the repo also has a committed `.git-workset.toml`, the external file wins silently. For `clone`, `-f` also skips the remote probe entirely (faster).
+
+Once others adopt worksets, commit the config and drop the flag.
+
 ### `git workset clone <url> <path> --workset <name>`
 
 Clones a repo from scratch with only the workset's files. Sparse checkout is configured *before* the first checkout, so git never iterates the full tree through smudge filters — this matters in large repos with tens of thousands of files.

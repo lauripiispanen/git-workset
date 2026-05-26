@@ -3,7 +3,7 @@ mod git;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use config::WorksetsConfig;
@@ -15,6 +15,11 @@ use config::WorksetsConfig;
     about = "Named sparse-checkout profiles for git worktrees"
 )]
 struct Cli {
+    /// Use this config file instead of the repo's .git-workset.toml.
+    /// Applies to clone, carve, sync, and switch. Overrides any committed config.
+    #[arg(short = 'f', long = "config", global = true, value_name = "FILE")]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -90,6 +95,14 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Resolve the explicit config path to absolute *now*, before any subcommand
+    // changes the working directory.
+    let config_override = match cli.config {
+        Some(p) if p.is_absolute() => Some(p),
+        Some(p) => Some(std::env::current_dir()?.join(p)),
+        None => None,
+    };
+
     match cli.command {
         Commands::Init => cmd_init(),
         Commands::Clone {
@@ -101,7 +114,14 @@ fn main() -> Result<()> {
             shallow,
         } => {
             let effective_depth = if shallow { Some(1) } else { depth };
-            cmd_clone(&url, &path, &workset, branch.as_deref(), effective_depth)
+            cmd_clone(
+                &url,
+                &path,
+                &workset,
+                branch.as_deref(),
+                effective_depth,
+                config_override.as_deref(),
+            )
         }
         Commands::Carve {
             path,
@@ -115,10 +135,11 @@ fn main() -> Result<()> {
             &workset,
             new_branch,
             force_branch,
+            config_override.as_deref(),
         ),
-        Commands::Sync => cmd_sync(),
+        Commands::Sync => cmd_sync(config_override.as_deref()),
         Commands::List => cmd_list(),
-        Commands::Switch { name } => cmd_switch(&name),
+        Commands::Switch { name } => cmd_switch(&name, config_override.as_deref()),
         Commands::Remove { path } => cmd_remove(&path),
         Commands::Deepen { by } => cmd_deepen(by),
     }
@@ -148,6 +169,7 @@ fn cmd_clone(
     workset_name: &str,
     branch: Option<&str>,
     depth: Option<u32>,
+    config_override: Option<&Path>,
 ) -> Result<()> {
     let abs_path = if path.is_absolute() {
         path.clone()
@@ -157,10 +179,12 @@ fn cmd_clone(
 
     eprintln!("Cloning {} into {}", url, abs_path.display());
 
-    // 1. Peek at the config from the remote before full clone.
-    //    We need to know the workset to set up sparse checkout before checkout.
-    eprintln!("Fetching workset config...");
-    let config = {
+    // Resolve the config: either an explicit -f file, or a minimal probe of the
+    // remote to read .git-workset.toml without a full checkout.
+    let config = if let Some(cfg_path) = config_override {
+        WorksetsConfig::load_from_path(cfg_path)?
+    } else {
+        eprintln!("Fetching workset config...");
         let tmp = abs_path.with_file_name(format!(
             ".{}-config-probe",
             abs_path.file_name().unwrap_or_default().to_string_lossy()
@@ -227,6 +251,7 @@ fn cmd_carve(
     workset_name: &str,
     new_branch: Option<String>,
     force_branch: Option<String>,
+    config_override: Option<&Path>,
 ) -> Result<()> {
     let repo_root = git::find_repo_root()?;
 
@@ -235,7 +260,11 @@ fn cmd_carve(
     // - the existing branch (when no -b/-B)
     // - HEAD (when -b/-B without commit-ish)
     let config_ref = commit_ish.unwrap_or("HEAD");
-    let config = WorksetsConfig::load_from_git(&repo_root, config_ref)?;
+    let config = if let Some(cfg_path) = config_override {
+        WorksetsConfig::load_from_path(cfg_path)?
+    } else {
+        WorksetsConfig::load_from_git(&repo_root, config_ref)?
+    };
     let workset = config.get_workset(workset_name)?;
 
     let abs_path = if path.is_absolute() {
@@ -304,14 +333,17 @@ fn cmd_carve(
     Ok(())
 }
 
-fn cmd_sync() -> Result<()> {
+fn cmd_sync(config_override: Option<&Path>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo_root = git::find_repo_root()?;
 
     let workset_name = git::read_workset_name(&cwd)?
         .context("No workset is active in this worktree. Use `worksets switch <name>` first.")?;
 
-    let config = WorksetsConfig::load(&repo_root)?;
+    let config = match config_override {
+        Some(p) => WorksetsConfig::load_from_path(p)?,
+        None => WorksetsConfig::load(&repo_root)?,
+    };
     let workset = config.get_workset(&workset_name)?;
 
     eprintln!("Syncing workset '{}' in {}", workset_name, cwd.display());
@@ -345,10 +377,13 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
-fn cmd_switch(name: &str) -> Result<()> {
+fn cmd_switch(name: &str, config_override: Option<&Path>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo_root = git::find_repo_root()?;
-    let config = WorksetsConfig::load(&repo_root)?;
+    let config = match config_override {
+        Some(p) => WorksetsConfig::load_from_path(p)?,
+        None => WorksetsConfig::load(&repo_root)?,
+    };
     let workset = config.get_workset(name)?;
 
     eprintln!("Switching to workset '{}' in {}", name, cwd.display());

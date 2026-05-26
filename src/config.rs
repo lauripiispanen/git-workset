@@ -49,10 +49,13 @@ fn default_true() -> bool {
 
 impl WorksetsConfig {
     pub fn load(repo_root: &Path) -> Result<Self> {
-        let config_path = repo_root.join(".git-workset.toml");
-        let content = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read {}", config_path.display()))?;
-        toml::from_str(&content).context("Failed to parse .git-workset.toml")
+        Self::load_from_path(&repo_root.join(".git-workset.toml"))
+    }
+
+    pub fn load_from_path(path: &Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))
     }
 
     /// Load config directly from the git tree without checking the file out.
