@@ -8,6 +8,14 @@ cargo clippy -- -D warnings
 cargo test
 ```
 
+## Submodule tests
+
+The integration tests wire up real submodules over `file://` URLs, which git
+refuses by default (CVE-2022-39253). The harness passes
+`protocol.file.allow=always` through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0` in
+`run_workset` and `run_git` — any new helper that shells out to git in the tests
+needs the same env, or submodule setup will fail.
+
 ## After changing CLI interface
 
 - Update README.md command docs and examples to match

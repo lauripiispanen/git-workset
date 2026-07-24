@@ -5,8 +5,51 @@ use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorksetsConfig {
+    /// Repo-wide submodule settings. Deliberately top-level, not per-workset:
+    /// object-store layout is a property of the repo, not of a profile.
+    #[serde(default)]
+    pub submodules: RepoSubmoduleConfig,
     #[serde(default)]
     pub workset: BTreeMap<String, Workset>,
+}
+
+/// Repo-wide `[submodules]` table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepoSubmoduleConfig {
+    #[serde(default)]
+    pub sharing: SubmoduleSharing,
+}
+
+/// How submodule object stores are laid out across worksets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubmoduleSharing {
+    /// Each workset's submodule checkout is a worktree of the main clone's
+    /// submodule gitdir — one object store per submodule, repo-wide.
+    #[default]
+    Shared,
+    /// Each workset gets its own submodule clone.
+    Isolated,
+}
+
+impl SubmoduleSharing {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubmoduleSharing::Shared => "shared",
+            SubmoduleSharing::Isolated => "isolated",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim() {
+            "shared" => Ok(SubmoduleSharing::Shared),
+            "isolated" => Ok(SubmoduleSharing::Isolated),
+            other => anyhow::bail!(
+                "invalid submodule sharing mode '{}' (valid options: shared, isolated)",
+                other
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +206,9 @@ impl WorksetsConfig {
                 sparse_cone: true,
             },
         );
-        WorksetsConfig { workset: worksets }
+        WorksetsConfig {
+            submodules: RepoSubmoduleConfig::default(),
+            workset: worksets,
+        }
     }
 }

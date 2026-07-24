@@ -1,4 +1,5 @@
 mod config;
+mod doctor;
 mod git;
 
 use anyhow::{bail, Context, Result};
@@ -6,7 +7,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use config::WorksetsConfig;
+use config::{SubmoduleSharing, WorksetsConfig};
 
 #[derive(Parser)]
 #[command(
@@ -20,8 +21,34 @@ struct Cli {
     #[arg(short = 'f', long = "config", global = true, value_name = "FILE")]
     config: Option<PathBuf>,
 
+    /// Share one submodule object store across all worksets (default)
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "isolated_submodules",
+        default_value_t = false
+    )]
+    shared_submodules: bool,
+
+    /// Give each workset its own submodule clone
+    #[arg(long, global = true, default_value_t = false)]
+    isolated_submodules: bool,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+impl Cli {
+    /// The mode requested on the command line, if any.
+    fn sharing_flag(&self) -> Option<SubmoduleSharing> {
+        if self.shared_submodules {
+            Some(SubmoduleSharing::Shared)
+        } else if self.isolated_submodules {
+            Some(SubmoduleSharing::Isolated)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -82,6 +109,16 @@ enum Commands {
     Remove {
         /// Path of the worktree to remove
         path: PathBuf,
+        /// Remove even if the worktree has local modifications
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Check submodule plumbing for known damage (and optionally repair it)
+    Doctor {
+        /// Apply the repairs instead of only reporting them
+        #[arg(long)]
+        fix: bool,
     },
 
     /// Fetch more history for a shallow clone
@@ -92,8 +129,64 @@ enum Commands {
     },
 }
 
+/// The submodule sharing mode recorded in a worktree at carve time.
+fn persisted_sharing(worktree_path: &Path) -> Option<SubmoduleSharing> {
+    let gitdir = git::worktree_git_dir(worktree_path).ok()?;
+    let value = git::config_file_get(&gitdir.join("config.worktree"), "workset.submoduleSharing")?;
+    SubmoduleSharing::parse(&value).ok()
+}
+
+fn record_sharing(worktree_path: &Path, mode: SubmoduleSharing) -> Result<()> {
+    git::run_git(
+        &[
+            "config",
+            "--worktree",
+            "workset.submoduleSharing",
+            mode.as_str(),
+        ],
+        worktree_path,
+    )
+}
+
+/// Resolve the submodule sharing mode (§3.2). Highest wins:
+/// CLI flag → mode already recorded in this worktree → git config →
+/// `.git-workset.toml` → default (`shared`).
+fn resolve_sharing(
+    repo_root: &Path,
+    config: &WorksetsConfig,
+    cli: Option<SubmoduleSharing>,
+    persisted: Option<SubmoduleSharing>,
+) -> Result<SubmoduleSharing> {
+    if let Some(mode) = cli {
+        return Ok(mode);
+    }
+    if let Some(mode) = persisted {
+        return Ok(mode);
+    }
+    if let Ok(value) =
+        git::run_git_output(&["config", "--get", "workset.submoduleSharing"], repo_root)
+    {
+        if !value.is_empty() {
+            return SubmoduleSharing::parse(&value)
+                .context("Invalid git config value for workset.submoduleSharing");
+        }
+    }
+    Ok(config.submodules.sharing)
+}
+
+fn print_submodule_summary(outcome: &git::SubmoduleOutcome) {
+    if outcome.shared + outcome.cloned + outcome.skipped == 0 {
+        return;
+    }
+    eprintln!(
+        "  submodules: {} shared ({} cloned), {} skipped",
+        outcome.shared, outcome.cloned, outcome.skipped
+    );
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let sharing_flag = cli.sharing_flag();
 
     // Resolve the explicit config path to absolute *now*, before any subcommand
     // changes the working directory.
@@ -121,6 +214,7 @@ fn main() -> Result<()> {
                 branch.as_deref(),
                 effective_depth,
                 config_override.as_deref(),
+                sharing_flag,
             )
         }
         Commands::Carve {
@@ -136,12 +230,14 @@ fn main() -> Result<()> {
             new_branch,
             force_branch,
             config_override.as_deref(),
+            sharing_flag,
         ),
-        Commands::Sync => cmd_sync(config_override.as_deref()),
+        Commands::Sync => cmd_sync(config_override.as_deref(), sharing_flag),
         Commands::List => cmd_list(),
-        Commands::Switch { name } => cmd_switch(&name, config_override.as_deref()),
-        Commands::Remove { path } => cmd_remove(&path),
+        Commands::Switch { name } => cmd_switch(&name, config_override.as_deref(), sharing_flag),
+        Commands::Remove { path, force } => cmd_remove(&path, force),
         Commands::Deepen { by } => cmd_deepen(by),
+        Commands::Doctor { fix } => cmd_doctor(fix, config_override.as_deref(), sharing_flag),
     }
 }
 
@@ -170,6 +266,7 @@ fn cmd_clone(
     branch: Option<&str>,
     depth: Option<u32>,
     config_override: Option<&Path>,
+    sharing_flag: Option<SubmoduleSharing>,
 ) -> Result<()> {
     let abs_path = if path.is_absolute() {
         path.clone()
@@ -230,9 +327,14 @@ fn cmd_clone(
     // 3. Enable worktree-scoped config
     git::enable_worktree_config(&abs_path)?;
 
-    // 4. Initialize submodules
+    // 4. Initialize submodules. A fresh clone *is* the shared object store, so
+    //    the submodules are cloned here regardless of mode — but they are
+    //    hardened straight away so the first carve has nothing to repair.
+    let sharing = resolve_sharing(&abs_path, &config, sharing_flag, None)?;
     eprintln!("\nInitializing submodules...");
-    git::init_submodules(&abs_path, &workset)?;
+    let outcome = git::init_submodules(&abs_path, &abs_path, &workset, sharing)?;
+    print_submodule_summary(&outcome);
+    record_sharing(&abs_path, sharing)?;
 
     // 5. Configure and pull LFS
     eprintln!("\nConfiguring LFS...");
@@ -252,6 +354,7 @@ fn cmd_carve(
     new_branch: Option<String>,
     force_branch: Option<String>,
     config_override: Option<&Path>,
+    sharing_flag: Option<SubmoduleSharing>,
 ) -> Result<()> {
     let repo_root = git::find_repo_root()?;
 
@@ -319,8 +422,12 @@ fn cmd_carve(
     git::apply_sparse_checkout(&abs_path, &workset)?;
 
     // 4. Initialize submodules
+    let sharing = resolve_sharing(&repo_root, &config, sharing_flag, None)?;
     eprintln!("\nInitializing submodules...");
-    git::init_submodules(&abs_path, &workset)?;
+    let outcome = git::init_submodules(&abs_path, &repo_root, &workset, sharing)?;
+    print_submodule_summary(&outcome);
+    // Remember the mode so `sync`/`switch` never convert the worktree silently.
+    record_sharing(&abs_path, sharing)?;
 
     // 5. Configure and pull LFS
     eprintln!("\nConfiguring LFS...");
@@ -333,7 +440,7 @@ fn cmd_carve(
     Ok(())
 }
 
-fn cmd_sync(config_override: Option<&Path>) -> Result<()> {
+fn cmd_sync(config_override: Option<&Path>, sharing_flag: Option<SubmoduleSharing>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo_root = git::find_repo_root()?;
 
@@ -349,8 +456,11 @@ fn cmd_sync(config_override: Option<&Path>) -> Result<()> {
     eprintln!("Syncing workset '{}' in {}", workset_name, cwd.display());
 
     git::enable_worktree_config(&cwd)?;
+    let sharing = resolve_sharing(&repo_root, &config, sharing_flag, persisted_sharing(&cwd))?;
     git::apply_sparse_checkout(&cwd, &workset)?;
-    git::init_submodules(&cwd, &workset)?;
+    let outcome = git::init_submodules(&cwd, &repo_root, &workset, sharing)?;
+    print_submodule_summary(&outcome);
+    record_sharing(&cwd, sharing)?;
     git::configure_lfs(&cwd, &workset)?;
 
     eprintln!("Done!");
@@ -377,7 +487,11 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
-fn cmd_switch(name: &str, config_override: Option<&Path>) -> Result<()> {
+fn cmd_switch(
+    name: &str,
+    config_override: Option<&Path>,
+    sharing_flag: Option<SubmoduleSharing>,
+) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo_root = git::find_repo_root()?;
     let config = match config_override {
@@ -389,9 +503,12 @@ fn cmd_switch(name: &str, config_override: Option<&Path>) -> Result<()> {
     eprintln!("Switching to workset '{}' in {}", name, cwd.display());
 
     git::enable_worktree_config(&cwd)?;
+    let sharing = resolve_sharing(&repo_root, &config, sharing_flag, persisted_sharing(&cwd))?;
     // Re-apply sparse checkout with new profile
     git::apply_sparse_checkout(&cwd, &workset)?;
-    git::init_submodules(&cwd, &workset)?;
+    let outcome = git::init_submodules(&cwd, &repo_root, &workset, sharing)?;
+    print_submodule_summary(&outcome);
+    record_sharing(&cwd, sharing)?;
     git::configure_lfs(&cwd, &workset)?;
 
     git::store_workset_name(&cwd, name)?;
@@ -400,16 +517,53 @@ fn cmd_switch(name: &str, config_override: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_remove(path: &PathBuf) -> Result<()> {
+fn cmd_remove(path: &PathBuf, force: bool) -> Result<()> {
     let abs_path = if path.is_absolute() {
         path.clone()
     } else {
         std::env::current_dir()?.join(path)
     };
+    let repo_root = git::find_repo_root()?;
 
     eprintln!("Removing worktree at {}", abs_path.display());
-    git::remove_worktree(&abs_path)?;
+    git::remove_worktree(&repo_root, &abs_path, force)?;
     eprintln!("Done!");
+    Ok(())
+}
+
+fn cmd_doctor(
+    fix: bool,
+    config_override: Option<&Path>,
+    sharing_flag: Option<SubmoduleSharing>,
+) -> Result<()> {
+    let repo_root = git::find_repo_root()?;
+    let config = match config_override {
+        Some(p) => WorksetsConfig::load_from_path(p)?,
+        None => WorksetsConfig::load(&repo_root).unwrap_or_else(|_| WorksetsConfig::template()),
+    };
+    let sharing = resolve_sharing(&repo_root, &config, sharing_flag, None)?;
+
+    let issues = doctor::run(&repo_root, sharing, fix)?;
+
+    if issues.is_empty() {
+        println!("doctor: no issues found");
+        return Ok(());
+    }
+
+    for issue in &issues {
+        let marker = if issue.fixed { "fixed" } else { "found" };
+        println!("[{}] {}: {}", issue.code, marker, issue.message);
+    }
+
+    let unfixed = issues.iter().filter(|i| !i.fixed).count();
+    if unfixed > 0 {
+        if !fix {
+            println!("\nRun `git workset doctor --fix` to repair.");
+        }
+        std::process::exit(1);
+    }
+
+    println!("\n{} issue(s) repaired.", issues.len());
     Ok(())
 }
 
