@@ -2309,3 +2309,389 @@ fn test_remove_refuses_dirty_worktree_without_force() {
         sub_list
     );
 }
+
+// ---- v0.5.0: config lookup, composition, strict config ----
+
+/// Run git-workset with `input` on stdin.
+fn run_workset_stdin(args: &[&str], cwd: &Path, input: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(git_workset_bin())
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+        .env("GIT_CONFIG_VALUE_0", "always")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn git-workset");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().expect("failed to wait")
+}
+
+fn carve_ok(repo: &Path, wt: &Path, branch: &str, workset: &str) {
+    run_git_ok(&["branch", branch], repo);
+    let output = run_workset(
+        &["carve", wt.to_str().unwrap(), branch, "-w", workset],
+        repo,
+    );
+    assert!(output.status.success(), "carve failed: {}", stderr(&output));
+}
+
+/// `switch` in a linked worktree uses that worktree's config, not the main
+/// worktree's.
+#[test]
+fn test_switch_reads_config_from_current_worktree() {
+    let (dir, repo) = create_test_repo();
+    let wt = dir.path().join("wt-own-cfg");
+    carve_ok(&repo, &wt, "own-cfg", "backend");
+
+    // Only this worktree's branch redefines frontend to include assets.
+    let cfg = std::fs::read_to_string(wt.join(".git-workset.toml"))
+        .unwrap()
+        .replace(
+            "include = [\"src/client\", \"src/shared\"]",
+            "include = [\"assets\"]",
+        );
+    std::fs::write(wt.join(".git-workset.toml"), cfg).unwrap();
+    run_git_ok(&["commit", "-am", "branch-local frontend"], &wt);
+
+    let output = run_workset(&["switch", "frontend"], &wt);
+    assert!(
+        output.status.success(),
+        "switch failed: {}",
+        stderr(&output)
+    );
+    assert!(
+        wt.join("assets/hello.txt").exists(),
+        "the worktree's own definition of frontend should apply"
+    );
+    assert!(
+        !wt.join("src/client/hello.txt").exists(),
+        "the main worktree's definition must not be used"
+    );
+}
+
+/// A full-tree profile composed with anything is still the full tree.
+#[test]
+fn test_compose_with_full_tree_profile_is_full_tree() {
+    let (dir, repo) = create_test_repo();
+    let wt = dir.path().join("wt-everything-plus");
+    carve_ok(&repo, &wt, "everything-plus", "everything+backend");
+
+    for p in ["src/server", "src/client", "src/shared", "assets"] {
+        assert!(
+            wt.join(p).join("hello.txt").exists(),
+            "{} should be checked out in everything+backend",
+            p
+        );
+    }
+}
+
+/// One profile's exclude does not remove what another explicitly includes.
+#[test]
+fn test_compose_exclude_does_not_remove_other_include() {
+    let (dir, repo) = create_test_repo();
+    let wt = dir.path().join("wt-noassets-plus");
+    carve_ok(&repo, &wt, "noassets-plus", "no-assets+all");
+
+    assert!(
+        wt.join("assets/hello.txt").exists(),
+        "all includes assets, so no-assets must not remove it"
+    );
+    assert!(wt.join("src/client/hello.txt").exists());
+}
+
+/// An exclude still applies when no other profile covers the excluded path,
+/// and a narrower include under it is re-added.
+#[test]
+fn test_compose_exclude_keeps_narrower_include() {
+    let (dir, repo) = create_test_repo();
+    let cfg = dir.path().join("compose.toml");
+    std::fs::write(
+        &cfg,
+        r#"
+[workset.no-src]
+exclude = ["src"]
+[workset.server]
+include = ["src/server"]
+"#,
+    )
+    .unwrap();
+    run_git_ok(&["branch", "narrow"], &repo);
+    let wt = dir.path().join("wt-narrow");
+    let output = run_workset(
+        &[
+            "-f",
+            cfg.to_str().unwrap(),
+            "carve",
+            wt.to_str().unwrap(),
+            "narrow",
+            "-w",
+            "no-src+server",
+        ],
+        &repo,
+    );
+    assert!(output.status.success(), "carve failed: {}", stderr(&output));
+    assert!(wt.join("assets/hello.txt").exists(), "no-src keeps assets");
+    assert!(
+        wt.join("src/server/hello.txt").exists(),
+        "server's include must survive no-src's exclude"
+    );
+    assert!(
+        !wt.join("src/client/hello.txt").exists(),
+        "the rest of src stays excluded"
+    );
+}
+
+/// No-cone includes are anchored at the root, like cone mode.
+#[test]
+fn test_no_cone_include_is_anchored() {
+    let (dir, repo) = create_test_repo();
+    std::fs::create_dir_all(repo.join("src/client/assets")).unwrap();
+    std::fs::write(repo.join("src/client/assets/nested.txt"), "nested").unwrap();
+    run_git_ok(&["add", "-A"], &repo);
+    run_git_ok(&["commit", "-m", "nested assets dir"], &repo);
+
+    let cfg = dir.path().join("nocone.toml");
+    std::fs::write(
+        &cfg,
+        "[workset.art]\ninclude = [\"assets\"]\nsparse_cone = false\n",
+    )
+    .unwrap();
+    run_git_ok(&["branch", "nocone"], &repo);
+    let wt = dir.path().join("wt-nocone");
+    let output = run_workset(
+        &[
+            "-f",
+            cfg.to_str().unwrap(),
+            "carve",
+            wt.to_str().unwrap(),
+            "nocone",
+            "-w",
+            "art",
+        ],
+        &repo,
+    );
+    assert!(output.status.success(), "carve failed: {}", stderr(&output));
+    assert!(wt.join("assets/hello.txt").exists());
+    assert!(
+        !wt.join("src/client/assets/nested.txt").exists(),
+        "`assets` must not match src/client/assets"
+    );
+}
+
+/// Switching to a profile that no longer skips a submodule brings it back,
+/// even in isolated mode where `active=false` would block the update.
+#[test]
+fn test_switch_unskips_previously_skipped_submodule() {
+    let (dir, repo) = create_test_repo();
+    run_git_ok(&["branch", "unskip"], &repo);
+    let wt = dir.path().join("wt-unskip");
+    let output = run_workset(
+        &[
+            "--isolated-submodules",
+            "carve",
+            wt.to_str().unwrap(),
+            "unskip",
+            "-w",
+            "backend",
+        ],
+        &repo,
+    );
+    assert!(output.status.success(), "carve failed: {}", stderr(&output));
+    assert_eq!(
+        worktree_config(&wt, "submodule.ext/lib.active").as_deref(),
+        Some("false")
+    );
+
+    let output = run_workset(&["switch", "with-sub"], &wt);
+    assert!(
+        output.status.success(),
+        "switch failed: {}",
+        stderr(&output)
+    );
+    assert!(
+        wt.join("ext/lib/lib.txt").exists(),
+        "ext/lib should be checked out after switching to with-sub"
+    );
+    assert_eq!(
+        worktree_config(&wt, "submodule.ext/lib.active"),
+        None,
+        "the stale active=false should be cleared"
+    );
+    assert_eq!(
+        worktree_config(&wt, "submodule.ext/lib2.active").as_deref(),
+        Some("false"),
+        "ext/lib2 is still skipped"
+    );
+}
+
+/// `switch` names sparse patterns added by hand that it is about to drop.
+#[test]
+fn test_switch_warns_about_dropped_manual_patterns() {
+    let (dir, repo) = create_test_repo();
+    let wt = dir.path().join("wt-dropped");
+    carve_ok(&repo, &wt, "dropped", "backend");
+    run_git_ok(&["sparse-checkout", "add", "assets"], &wt);
+
+    let output = run_workset(&["switch", "frontend"], &wt);
+    assert!(
+        output.status.success(),
+        "switch failed: {}",
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("warning: dropping sparse patterns") && err.contains("assets"),
+        "switch should name the dropped pattern: {}",
+        err
+    );
+    assert!(
+        !err.contains("src/server, "),
+        "patterns git-workset applied itself are not reported: {}",
+        err
+    );
+}
+
+/// A plain re-sync with no manual additions prints no warning.
+#[test]
+fn test_sync_without_manual_patterns_does_not_warn() {
+    let (dir, repo) = create_test_repo();
+    let wt = dir.path().join("wt-nowarn");
+    carve_ok(&repo, &wt, "nowarn", "backend");
+
+    let output = run_workset(&["switch", "frontend"], &wt);
+    assert!(
+        output.status.success(),
+        "switch failed: {}",
+        stderr(&output)
+    );
+    assert!(
+        !stderr(&output).contains("dropping"),
+        "nothing was added by hand: {}",
+        stderr(&output)
+    );
+}
+
+/// `-f -` reads the config from stdin.
+#[test]
+fn test_config_from_stdin() {
+    let (dir, repo) = create_test_repo();
+    let wt = dir.path().join("wt-stdin");
+    carve_ok(&repo, &wt, "stdin", "backend");
+
+    let output = run_workset_stdin(
+        &["-f", "-", "switch", "piped"],
+        &wt,
+        "[workset.piped]\ninclude = [\"assets\"]\n",
+    );
+    assert!(
+        output.status.success(),
+        "switch failed: {}",
+        stderr(&output)
+    );
+    assert!(wt.join("assets/hello.txt").exists());
+    assert!(!wt.join("src/server/hello.txt").exists());
+}
+
+/// An empty config says so instead of printing an empty list.
+#[test]
+fn test_empty_config_error_message() {
+    let (dir, repo) = create_test_repo();
+    let output = run_workset_stdin(&["-f", "-", "switch", "a"], &repo, "");
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(
+        err.contains("defines no worksets") && !err.contains("Available: \n"),
+        "unhelpful message: {}",
+        err
+    );
+    drop(dir);
+}
+
+/// Unknown keys are errors that name the key, at any depth.
+#[test]
+fn test_unknown_config_key_is_rejected() {
+    let (dir, repo) = create_test_repo();
+    for (cfg, key) in [
+        ("bogus = 1\n[workset.a]\ninclude = [\"src\"]\n", "bogus"),
+        ("[workset.a]\nincldue = [\"src\"]\n", "incldue"),
+        (
+            "[workset.a]\ninclude = [\"src\"]\n[workset.a.submodules]\nskp = []\n",
+            "skp",
+        ),
+    ] {
+        let output = run_workset_stdin(&["-f", "-", "switch", "a"], &repo, cfg);
+        assert!(!output.status.success(), "{} should be rejected", key);
+        assert!(
+            stderr(&output).contains(key),
+            "error should name `{}`: {}",
+            key,
+            stderr(&output)
+        );
+    }
+    drop(dir);
+}
+
+/// A config written for a newer git-workset is refused.
+#[test]
+fn test_newer_config_version_is_rejected() {
+    let (dir, repo) = create_test_repo();
+    let output = run_workset_stdin(
+        &["-f", "-", "switch", "a"],
+        &repo,
+        "version = 2\n[workset.a]\ninclude = [\"src\"]\n",
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("unsupported config version 2"),
+        "{}",
+        stderr(&output)
+    );
+
+    let output = run_workset_stdin(
+        &["-f", "-", "switch", "a"],
+        &repo,
+        "version = 1\n[workset.a]\ninclude = [\"src\"]\n",
+    );
+    assert!(
+        output.status.success(),
+        "version 1 is accepted: {}",
+        stderr(&output)
+    );
+    drop(dir);
+}
+
+/// git's own output never lands on stdout.
+#[test]
+fn test_child_git_output_goes_to_stderr() {
+    let (dir, repo) = create_test_repo();
+    run_git_ok(&["branch", "quiet"], &repo);
+    let wt = dir.path().join("wt-quiet");
+    let output = run_workset(
+        &[
+            "--isolated-submodules",
+            "carve",
+            wt.to_str().unwrap(),
+            "quiet",
+            "-w",
+            "with-subs",
+        ],
+        &repo,
+    );
+    assert!(output.status.success(), "carve failed: {}", stderr(&output));
+    assert_eq!(stdout(&output), "", "stdout should be empty");
+    assert!(
+        stderr(&output).contains("ext/lib"),
+        "git's submodule output should be on stderr"
+    );
+}

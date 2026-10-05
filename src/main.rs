@@ -174,6 +174,56 @@ fn resolve_sharing(
     Ok(config.submodules.sharing)
 }
 
+/// Config for commands that act on an existing worktree: `-f` if given, else
+/// this worktree's `.git-workset.toml` — the working-tree file so uncommitted
+/// edits are picked up by `sync`, falling back to the one at its `HEAD`.
+/// Never the main worktree's file.
+fn load_worktree_config(cwd: &Path, config_override: Option<&Path>) -> Result<WorksetsConfig> {
+    if let Some(p) = config_override {
+        return WorksetsConfig::load_from_path(p);
+    }
+    let toplevel = git::show_toplevel(cwd)?;
+    let file = toplevel.join(".git-workset.toml");
+    if file.exists() {
+        WorksetsConfig::load_from_path(&file)
+    } else {
+        WorksetsConfig::load_from_git(&toplevel, "HEAD")
+    }
+}
+
+/// Warn about sparse patterns added outside git-workset (e.g. by
+/// `git sparse-checkout add`) that applying `workset` is about to drop.
+fn warn_dropped_patterns(cwd: &Path, workset: &config::Workset) {
+    let (Some(current), Some(applied)) = (
+        git::current_sparse_patterns(cwd),
+        git::read_applied_patterns(cwd),
+    ) else {
+        return;
+    };
+    let next = git::build_sparse_args(workset)
+        .map(|(_, p)| p)
+        .unwrap_or_default();
+    // Cone-mode listings drop trailing slashes the config may have.
+    let norm = |p: &String| p.trim_end_matches('/').to_string();
+    let known: Vec<String> = applied.iter().chain(next.iter()).map(norm).collect();
+    let dropped: Vec<&String> = current
+        .iter()
+        .filter(|p| !known.contains(&norm(p)))
+        .collect();
+    if dropped.is_empty() || next.is_empty() {
+        return;
+    }
+    eprintln!(
+        "  warning: dropping sparse patterns added outside git-workset: {}",
+        dropped
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    eprintln!("  (re-add them with `git sparse-checkout add`)");
+}
+
 fn print_submodule_summary(outcome: &git::SubmoduleOutcome) {
     if outcome.shared + outcome.cloned + outcome.skipped == 0 {
         return;
@@ -191,7 +241,7 @@ fn main() -> Result<()> {
     // Resolve the explicit config path to absolute *now*, before any subcommand
     // changes the working directory.
     let config_override = match cli.config {
-        Some(p) if p.is_absolute() => Some(p),
+        Some(p) if p.is_absolute() || p.as_os_str() == "-" => Some(p),
         Some(p) => Some(std::env::current_dir()?.join(p)),
         None => None,
     };
@@ -447,21 +497,20 @@ fn cmd_sync(config_override: Option<&Path>, sharing_flag: Option<SubmoduleSharin
     let workset_name = git::read_workset_name(&cwd)?
         .context("No workset is active in this worktree. Use `worksets switch <name>` first.")?;
 
-    let config = match config_override {
-        Some(p) => WorksetsConfig::load_from_path(p)?,
-        None => WorksetsConfig::load(&repo_root)?,
-    };
+    let config = load_worktree_config(&cwd, config_override)?;
     let workset = config.get_workset(&workset_name)?;
 
     eprintln!("Syncing workset '{}' in {}", workset_name, cwd.display());
 
     git::enable_worktree_config(&cwd)?;
     let sharing = resolve_sharing(&repo_root, &config, sharing_flag, persisted_sharing(&cwd))?;
+    warn_dropped_patterns(&cwd, &workset);
     git::apply_sparse_checkout(&cwd, &workset)?;
     let outcome = git::init_submodules(&cwd, &repo_root, &workset, sharing)?;
     print_submodule_summary(&outcome);
     record_sharing(&cwd, sharing)?;
     git::configure_lfs(&cwd, &workset)?;
+    git::store_workset_name(&cwd, &workset_name)?;
 
     eprintln!("Done!");
     Ok(())
@@ -494,10 +543,7 @@ fn cmd_switch(
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo_root = git::find_repo_root()?;
-    let config = match config_override {
-        Some(p) => WorksetsConfig::load_from_path(p)?,
-        None => WorksetsConfig::load(&repo_root)?,
-    };
+    let config = load_worktree_config(&cwd, config_override)?;
     let workset = config.get_workset(name)?;
 
     eprintln!("Switching to workset '{}' in {}", name, cwd.display());
@@ -505,6 +551,7 @@ fn cmd_switch(
     git::enable_worktree_config(&cwd)?;
     let sharing = resolve_sharing(&repo_root, &config, sharing_flag, persisted_sharing(&cwd))?;
     // Re-apply sparse checkout with new profile
+    warn_dropped_patterns(&cwd, &workset);
     git::apply_sparse_checkout(&cwd, &workset)?;
     let outcome = git::init_submodules(&cwd, &repo_root, &workset, sharing)?;
     print_submodule_summary(&outcome);

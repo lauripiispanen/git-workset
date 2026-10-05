@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::config::{SubmoduleSharing, Workset};
 
@@ -61,12 +61,19 @@ pub fn worktree_git_dir(worktree_path: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Stdout reserved for git-workset's own output: child processes write theirs
+/// to stderr instead.
+pub(crate) fn stdout_to_stderr() -> Stdio {
+    Stdio::from(std::io::stderr())
+}
+
 pub(crate) fn run_git(args: &[&str], cwd: &Path) -> Result<()> {
     let display_args = args.join(" ");
     eprintln!("  git {}", display_args);
     let status = Command::new("git")
         .args(args)
         .current_dir(cwd)
+        .stdout(stdout_to_stderr())
         .status()
         .with_context(|| format!("Failed to run: git {}", display_args))?;
     if !status.success() {
@@ -141,22 +148,8 @@ pub fn sparse_clone(
 
     // 3. Configure sparse checkout BEFORE any fetch/checkout
     //    Skip if both include and exclude are empty (full tree).
-    if !workset.include.is_empty() || !workset.exclude.is_empty() {
-        let (use_cone, patterns) = build_sparse_args(workset);
-
-        if use_cone {
-            run_git(&["sparse-checkout", "init", "--cone"], path)?;
-        } else {
-            run_git(&["sparse-checkout", "init"], path)?;
-        }
-
-        let mut sparse_args: Vec<&str> = vec!["sparse-checkout", "set"];
-        let pattern_refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
-        sparse_args.extend(&pattern_refs);
-        if !use_cone {
-            sparse_args.push("--no-cone");
-        }
-        run_git(&sparse_args, path)?;
+    if !workset.is_full_tree() {
+        apply_sparse_checkout(path, workset)?;
     }
 
     // 4. Fetch (optionally shallow)
@@ -175,6 +168,7 @@ pub fn sparse_clone(
         .env("GIT_LFS_SKIP_SMUDGE", "1")
         .args(&fetch_args)
         .current_dir(path)
+        .stdout(stdout_to_stderr())
         .status()
         .context("Failed to fetch")?;
     if !fetch_status.success() {
@@ -252,6 +246,7 @@ pub fn add_worktree(path: &Path, branch: WorktreeBranch, commit_ish: Option<&str
     let status = Command::new("git")
         .env("GIT_LFS_SKIP_SMUDGE", "1")
         .args(&arg_refs)
+        .stdout(stdout_to_stderr())
         .status()
         .context("Failed to create worktree")?;
     if !status.success() {
@@ -260,36 +255,60 @@ pub fn add_worktree(path: &Path, branch: WorktreeBranch, commit_ish: Option<&str
     Ok(())
 }
 
-/// Build the sparse-checkout set arguments for a workset.
-/// When excludes are present, forces --no-cone mode and generates negated patterns.
-fn build_sparse_args(workset: &Workset) -> (bool, Vec<String>) {
+/// Anchor a no-cone include at the repo root so `a` means `/a`, as in cone
+/// mode, rather than any `a` anywhere. Entries that already start with `/` or
+/// use glob syntax are taken as written.
+fn anchor_no_cone(include: &str) -> String {
+    if include.starts_with('/') || include.contains(['*', '?', '[', '!']) {
+        include.to_string()
+    } else {
+        format!("/{}", include.trim_end_matches('/'))
+    }
+}
+
+/// The sparse-checkout mode and patterns for a workset, or `None` for a full
+/// tree. Excludes force no-cone mode and become negated patterns.
+pub fn build_sparse_args(workset: &Workset) -> Option<(bool, Vec<String>)> {
+    if workset.is_full_tree() {
+        return None;
+    }
     let use_cone = workset.sparse_cone && workset.exclude.is_empty();
+    if use_cone {
+        return Some((true, workset.include.to_vec()));
+    }
 
-    let mut patterns: Vec<String> = workset.include.to_vec();
-
+    let mut patterns: Vec<String> = workset.include.iter().map(|i| anchor_no_cone(i)).collect();
     if !workset.exclude.is_empty() {
         // In no-cone mode, ensure we have a catch-all include
         if patterns.is_empty() {
             patterns.push("/*".to_string());
         }
         for dir in &workset.exclude {
-            patterns.push(format!("!/{}/", dir));
+            patterns.push(format!("!/{}/", dir.trim_matches('/')));
+        }
+        // Later patterns win, so these come after the excludes.
+        for dir in &workset.reinclude {
+            patterns.push(format!("/{}/", dir.trim_matches('/')));
         }
     }
 
-    (use_cone, patterns)
+    Some((false, patterns))
+}
+
+/// The worktree's current sparse patterns, or `None` if it is not sparse.
+pub fn current_sparse_patterns(worktree_path: &Path) -> Option<Vec<String>> {
+    let out = run_git_output(&["sparse-checkout", "list"], worktree_path).ok()?;
+    Some(out.lines().map(|l| l.to_string()).collect())
 }
 
 /// Apply sparse checkout configuration to a worktree.
 /// If both include and exclude are empty, sparse checkout is skipped (full tree).
 pub fn apply_sparse_checkout(worktree_path: &Path, workset: &Workset) -> Result<()> {
-    if workset.include.is_empty() && workset.exclude.is_empty() {
+    let Some((use_cone, patterns)) = build_sparse_args(workset) else {
         // No sparse checkout — disable it if it was previously enabled
         let _ = run_git(&["sparse-checkout", "disable"], worktree_path);
         return Ok(());
-    }
-
-    let (use_cone, patterns) = build_sparse_args(workset);
+    };
 
     if use_cone {
         run_git(&["sparse-checkout", "init", "--cone"], worktree_path)?;
@@ -734,8 +753,17 @@ pub fn init_submodules(
     let mut outcome = SubmoduleOutcome::default();
 
     let mut wanted: Vec<(String, String)> = Vec::new();
+    let wt_config = worktree_git_dir(worktree_path)?.join("config.worktree");
 
     for (name, path) in &entries {
+        let active_key = format!("submodule.{}.active", name);
+        if !workset.submodules.skip.iter().any(|s| s == path)
+            && config_file_get(&wt_config, &active_key).as_deref() == Some("false")
+        {
+            // Written by an earlier profile that skipped it; left in place it
+            // would make the update below a silent no-op.
+            config_file_unset(&wt_config, &active_key)?;
+        }
         if workset.submodules.skip.iter().any(|s| s == path) {
             eprintln!("  skipping submodule: {}", path);
             outcome.skipped += 1;
@@ -940,13 +968,36 @@ pub fn configure_lfs(worktree_path: &Path, workset: &Workset) -> Result<()> {
     Ok(())
 }
 
-/// Store which workset name is active in this worktree.
+/// Store which workset name is active in this worktree, and the sparse
+/// patterns it applied so a later `switch` can tell them from ones added by
+/// hand.
 pub fn store_workset_name(worktree_path: &Path, workset_name: &str) -> Result<()> {
     let git_dir = worktree_git_dir(worktree_path)?;
     let marker = git_dir.join("workset");
     std::fs::write(&marker, workset_name)
         .with_context(|| format!("Failed to write {}", marker.display()))?;
+    let applied = current_sparse_patterns(worktree_path).unwrap_or_default();
+    let record = git_dir.join("workset-patterns");
+    std::fs::write(&record, applied.join("\n"))
+        .with_context(|| format!("Failed to write {}", record.display()))?;
     Ok(())
+}
+
+/// The sparse patterns git-workset last applied to this worktree, if recorded.
+pub fn read_applied_patterns(worktree_path: &Path) -> Option<Vec<String>> {
+    let record = worktree_git_dir(worktree_path)
+        .ok()?
+        .join("workset-patterns");
+    let content = std::fs::read_to_string(record).ok()?;
+    Some(content.lines().map(|l| l.to_string()).collect())
+}
+
+/// Top of the working tree containing `cwd`.
+pub fn show_toplevel(cwd: &Path) -> Result<PathBuf> {
+    Ok(PathBuf::from(run_git_output(
+        &["rev-parse", "--show-toplevel"],
+        cwd,
+    )?))
 }
 
 /// Read the active workset name for a worktree.

@@ -18,6 +18,12 @@ This uses a [Homebrew tap](https://github.com/lauripiispanen/homebrew-tap). The 
 
 Download the latest release from [GitHub Releases](https://github.com/lauripiispanen/git-workset/releases), extract the archive, and place `git-workset` somewhere on your `PATH`.
 
+On Linux, prefer the `*-unknown-linux-musl` archives: they are statically linked and run on any distribution, including Alpine and older-glibc hosts such as Debian 12, Ubuntu 22.04 and RHEL 9. The `*-linux-gnu` builds need a recent glibc. `SHA256SUMS` covers every archive:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
 ### From source
 
 ```sh
@@ -57,6 +63,8 @@ git workset carve ../fix -b fix main --workset server+art
 Define profiles in `.git-workset.toml` at the repo root:
 
 ```toml
+version = 1            # optional; a newer git-workset may add versions
+
 # Repo-wide settings (not per-profile — see "Submodules and worksets")
 [submodules]
 sharing = "shared"     # or "isolated"
@@ -95,7 +103,7 @@ Per-profile fields, under `[workset.<name>]`:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `description` | — | Human-readable profile description |
-| `include` | `[]` | Directories to include in sparse checkout (empty = full tree) |
+| `include` | `[]` | Directories to include in sparse checkout, relative to the repo root (empty = full tree). In no-cone mode an entry without a leading `/` or glob is anchored at the root, so `assets` means `/assets`, not any `assets` directory |
 | `exclude` | `[]` | Directories to exclude from sparse checkout (forces `--no-cone` mode) |
 | `exclude_lfs` | `[]` | LFS patterns to skip downloading |
 | `include_lfs` | `[]` | LFS patterns to download (if set, only these are fetched) |
@@ -107,7 +115,11 @@ Repo-wide settings, top-level:
 
 | Field | Default | Description |
 |-------|---------|-------------|
+| `version` | `1` | Config schema version. A git-workset that does not know the version refuses the file |
 | `submodules.sharing` | `"shared"` | `"shared"`: all worksets check out the same submodule object store. `"isolated"`: every workset clones its own copy (pre-0.4 behaviour) |
+
+Unknown keys are an error, so a typo such as `incldue` or a `skip` at the wrong
+level fails loudly instead of silently doing nothing.
 
 `[submodules]` is deliberately repo-wide rather than per-profile: a profile
 describes *which files you want*, while the object-store layout is a property of
@@ -122,11 +134,23 @@ Precedence for the sharing mode, highest first:
 4. `[submodules] sharing` in `.git-workset.toml`
 5. the default, `shared`
 
+### Composing profiles
+
+`server+art` checks out the union of what `server` and `art` each check out:
+
+- If any part is a full-tree profile (no `include` and no `exclude`), the result is the full tree.
+- Includes are unioned. A part with only excludes includes everything else.
+- An exclude in one part never removes what another part includes: it is dropped
+  if another part covers the whole path, and narrower includes under it are kept.
+- Cone mode is used only if every part allows it and nothing is excluded.
+
+LFS patterns and `submodules.skip` are unioned; `submodules.shallow` is on if any part wants it.
+
 ## Commands
 
 ### Using an external config (`-f` / `--config`)
 
-Every command below accepts a global `-f <path>` (or `--config <path>`) to read worksets from an external TOML file instead of the repo's committed `.git-workset.toml`. Useful when you work across many similar repos that haven't adopted worksets yet — keep a personal config and apply it everywhere:
+Every command below accepts a global `-f <path>` (or `--config <path>`) to read worksets from an external TOML file instead of the repo's committed `.git-workset.toml`. `-f -` reads the config from stdin. Useful when you work across many similar repos that haven't adopted worksets yet — keep a personal config and apply it everywhere:
 
 ```bash
 git workset -f ~/worksets/unreal-engine.toml clone <url> game-a --workset engine-only
@@ -206,9 +230,18 @@ git workset carve ../retry -B stale-branch --workset server
 
 Re-applies the active workset profile to the current worktree. Run this after editing `.git-workset.toml` to pick up changes.
 
+`sync` and `switch` read the current worktree's own `.git-workset.toml` (falling
+back to the one committed at its `HEAD`), so a worktree on a branch with
+different profiles uses that branch's definitions, not the main worktree's.
+
 ### `git workset switch <name>`
 
 Switches the current worktree to a different workset profile in-place, without recreating the worktree.
+
+The sparse patterns are replaced, so directories added by hand with
+`git sparse-checkout add` are dropped; `switch` and `sync` name them in a warning
+so you can re-add them. Switching to a profile that no longer skips a submodule
+clears the `active=false` the earlier profile wrote and checks it out.
 
 ### `git workset list`
 
