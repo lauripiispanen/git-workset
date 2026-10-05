@@ -3136,3 +3136,55 @@ fn test_profiles_from_rev() {
         serde_json::json!(["src/server", "src/shared"])
     );
 }
+
+// ---- v0.6.1: submodules.shallow default ----
+
+/// A profile with no `[workset.x.submodules]` table clones submodules
+/// shallow, as documented.
+#[test]
+fn test_shallow_defaults_to_true_without_submodules_table() {
+    let (dir, repo) = create_test_repo();
+    // Give ext/lib two commits so depth 1 actually cuts history.
+    let sub_repo = dir.path().join("subrepo");
+    std::fs::write(sub_repo.join("lib.txt"), "second").unwrap();
+    run_git_ok(&["commit", "-am", "sub second"], &sub_repo);
+    let checkout = repo.join("ext/lib");
+    run_git_ok(&["pull", "-q", "origin", "main"], &checkout);
+    run_git_ok(&["commit", "-am", "bump ext/lib"], &repo);
+
+    // `with-subs` defines no submodules table.
+    run_git_ok(&["branch", "shallow-default"], &repo);
+    let wt = dir.path().join("wt-shallow-default");
+    let output = run_workset(
+        &[
+            "--isolated-submodules",
+            "carve",
+            wt.to_str().unwrap(),
+            "shallow-default",
+            "-w",
+            "with-subs",
+        ],
+        &repo,
+    );
+    assert!(output.status.success(), "carve failed: {}", stderr(&output));
+    let shallow = stdout(&run_git(
+        &["rev-parse", "--is-shallow-repository"],
+        &wt.join("ext/lib"),
+    ));
+    assert_eq!(
+        shallow.trim(),
+        "true",
+        "submodule should be a shallow clone"
+    );
+
+    let output = run_workset(&["--json", "profiles"], &repo);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let doc = json_doc(&output);
+    let with_subs = doc["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "with-subs")
+        .unwrap();
+    assert_eq!(with_subs["submodules"]["shallow"], true);
+}

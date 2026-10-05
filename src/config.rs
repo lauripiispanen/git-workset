@@ -118,7 +118,7 @@ fn push_unique(list: &mut Vec<String>, item: &str) {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmoduleConfig {
     /// Clone submodules with --depth 1
@@ -127,6 +127,17 @@ pub struct SubmoduleConfig {
     /// Submodule paths to skip entirely
     #[serde(default)]
     pub skip: Vec<String>,
+}
+
+/// Used when a profile has no `[workset.x.submodules]` table at all, so it
+/// must agree with the per-field defaults above.
+impl Default for SubmoduleConfig {
+    fn default() -> Self {
+        SubmoduleConfig {
+            shallow: true,
+            skip: vec![],
+        }
+    }
 }
 
 fn default_true() -> bool {
