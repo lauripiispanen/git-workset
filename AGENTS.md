@@ -16,6 +16,20 @@ refuses by default (CVE-2022-39253). The harness passes
 `run_workset` and `run_git` — any new helper that shells out to git in the tests
 needs the same env, or submodule setup will fail.
 
+## Old git versions
+
+CI also runs the suite on git 2.34 (Ubuntu 22.04) and 2.39 (Debian 12). Below
+git 2.42 there is no `sparse-checkout check-rules`, so fallback paths run there.
+To reproduce locally (needs Docker):
+
+```sh
+scripts/test-old-git.sh                      # both images
+scripts/test-old-git.sh debian:12 test_apply # one image, filtered
+```
+
+Partial-clone tests need `uploadpack.allowFilter=true` on the `file://` origin,
+otherwise git silently sends every blob and the clone is not partial.
+
 ## After changing CLI interface
 
 - Update README.md command docs and examples to match

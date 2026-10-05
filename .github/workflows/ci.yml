@@ -37,6 +37,34 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+  old-git:
+    name: Test (old git, ${{ matrix.image }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest git versions on supported distributions: 2.34 and 2.39.
+        # Below 2.42 there is no `sparse-checkout check-rules`, which
+        # exercises the fallback paths.
+        image: ["ubuntu:22.04", "debian:12"]
+    steps:
+      - name: Install git and build tools
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git curl ca-certificates build-essential
+          git --version
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cargo test --verbose
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
