@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::config::{SubmoduleSharing, Workset};
+use crate::error::Kind;
 
 /// Oldest git that honours `extensions.worktreeConfig`.
 const MIN_WORKTREE_CONFIG_VERSION: (u32, u32) = (2, 20);
@@ -381,13 +382,52 @@ pub(crate) fn parse_submodule_entries(worktree_path: &Path) -> Result<Vec<(Strin
         .collect())
 }
 
+/// The content of `path` at `rev`, read from the object store (fetching the
+/// blob from a promisor remote if needed), or `None` if the commit's tree has
+/// no such file.
+///
+/// Absent and unreadable are told apart by `ls-tree`, which only needs tree
+/// objects — present even in a blobless clone with no remote. A listed path
+/// whose blob cannot be read is `FetchFailed`, never "absent".
+pub fn read_blob_at(cwd: &Path, rev: &str, path: &str) -> Result<Option<String>> {
+    let spec = format!("{}:{}", rev, path);
+    let commit = format!("{}^{{commit}}", rev);
+    if run_git_output(&["rev-parse", "--verify", "--quiet", &commit], cwd).is_err() {
+        return Err(Kind::ConfigMissing {
+            source: spec,
+            reason: format!("'{}' is not a commit in this repository", rev),
+        }
+        .into());
+    }
+    let listed = run_git_output(&["ls-tree", "--name-only", &commit, "--", path], cwd)?;
+    if listed.is_empty() {
+        return Ok(None);
+    }
+    let output = Command::new("git")
+        .args(["cat-file", "blob", &spec])
+        .current_dir(cwd)
+        .output()
+        .context("Failed to run git cat-file")?;
+    if !output.status.success() {
+        return Err(Kind::FetchFailed {
+            source: spec,
+            git_stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        }
+        .into());
+    }
+    Ok(Some(
+        String::from_utf8(output.stdout).with_context(|| format!("Invalid UTF-8 in {}", spec))?,
+    ))
+}
+
 /// (name, path) pairs from `.gitmodules` at `rev`, read from the object store
 /// so it works before the first checkout.
 pub fn parse_submodule_entries_at(cwd: &Path, rev: &str) -> Result<Vec<(String, String)>> {
-    let blob = format!("{}:.gitmodules", rev);
-    if run_git_output(&["cat-file", "-e", &blob], cwd).is_err() {
+    if read_blob_at(cwd, rev, ".gitmodules")?.is_none() {
         return Ok(vec![]);
     }
+    // The blob is local now, so this cannot fetch.
+    let blob = format!("{}:.gitmodules", rev);
     let output = run_git_output(
         &[
             "config",
@@ -408,31 +448,57 @@ pub fn parse_submodule_entries_at(cwd: &Path, rev: &str) -> Result<Vec<(String, 
         .collect())
 }
 
-/// Which of `paths` fall inside the sparse patterns, by git's own rules
-/// (`git sparse-checkout check-rules`, git 2.42+). On older git, cone mode
-/// is decided here; no-cone patterns are too rich to re-implement, so every
-/// path is reported in the cone.
+/// Oldest git with `git sparse-checkout check-rules`.
+const MIN_CHECK_RULES_VERSION: (u32, u32) = (2, 42);
+
+/// Which of `paths` fall inside the sparse patterns: `Some(true/false)`, or
+/// `None` when it cannot be decided exactly. Uses git's own rules
+/// (`git sparse-checkout check-rules`, git 2.42+). On older git, cone mode is
+/// decided here; no-cone patterns are too rich to re-implement, so their
+/// answer is `None` rather than a guess.
 pub fn paths_in_sparse(
     cwd: &Path,
     sparse: Option<&(bool, Vec<String>)>,
     paths: &[String],
-) -> Result<Vec<bool>> {
-    use std::io::Write;
-    let Some((cone, patterns)) = sparse else {
-        return Ok(vec![true; paths.len()]);
-    };
+) -> Result<Vec<Option<bool>>> {
     if paths.is_empty() {
         return Ok(vec![]);
     }
-    if git_version()? < (2, 42) {
-        return Ok(paths
-            .iter()
-            .map(|p| !*cone || in_cone_fallback(p, patterns))
-            .collect());
+    if let Some(answer) = sparse_without_check_rules(git_version()?, sparse, paths) {
+        return Ok(answer);
     }
+    let (cone, patterns) = sparse.expect("handled above when not sparse");
+    Ok(check_rules(cwd, *cone, patterns, paths)?
+        .into_iter()
+        .map(Some)
+        .collect())
+}
+
+/// The answer when `check-rules` is not needed or not available.
+fn sparse_without_check_rules(
+    version: (u32, u32),
+    sparse: Option<&(bool, Vec<String>)>,
+    paths: &[String],
+) -> Option<Vec<Option<bool>>> {
+    let Some((cone, patterns)) = sparse else {
+        return Some(vec![Some(true); paths.len()]);
+    };
+    if version >= MIN_CHECK_RULES_VERSION {
+        return None;
+    }
+    Some(
+        paths
+            .iter()
+            .map(|p| cone.then(|| in_cone_fallback(p, patterns)))
+            .collect(),
+    )
+}
+
+fn check_rules(cwd: &Path, cone: bool, patterns: &[String], paths: &[String]) -> Result<Vec<bool>> {
+    use std::io::Write;
 
     let rules = tempfile_in_git_dir(cwd, "workset-rules", &patterns.join("\n"))?;
-    let mode = if *cone { "--cone" } else { "--no-cone" };
+    let mode = if cone { "--cone" } else { "--no-cone" };
     let mut child = Command::new("git")
         .args(["sparse-checkout", "check-rules", mode, "--rules-file"])
         .arg(&rules)
@@ -1215,7 +1281,30 @@ pub fn remove_worktree(main_repo: &Path, path: &Path, force: bool) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::in_cone_fallback;
+    use super::{in_cone_fallback, sparse_without_check_rules};
+
+    /// On git < 2.42 a no-cone profile cannot be decided, and says so
+    /// instead of guessing `in_cone`.
+    #[test]
+    fn old_git_no_cone_is_unknown() {
+        let sparse = (false, vec!["/docs".to_string()]);
+        let paths = vec!["ext/lib".to_string(), "docs/theme".to_string()];
+        assert_eq!(
+            sparse_without_check_rules((2, 39), Some(&sparse), &paths),
+            Some(vec![None, None])
+        );
+        // Cone mode is still decided exactly.
+        let cone = (true, vec!["docs".to_string()]);
+        assert_eq!(
+            sparse_without_check_rules((2, 39), Some(&cone), &paths),
+            Some(vec![Some(false), Some(true)])
+        );
+        // New git defers to check-rules.
+        assert_eq!(
+            sparse_without_check_rules((2, 42), Some(&sparse), &paths),
+            None
+        );
+    }
 
     /// Must agree with `git sparse-checkout check-rules --cone`.
     #[test]

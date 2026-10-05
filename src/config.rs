@@ -105,6 +105,15 @@ impl Workset {
     }
 }
 
+/// A repo-relative path as git writes it: no leading `./`, no trailing `/`.
+fn normalise_path(path: &str) -> String {
+    let mut p = path.trim();
+    while let Some(rest) = p.strip_prefix("./") {
+        p = rest;
+    }
+    p.trim_end_matches('/').to_string()
+}
+
 /// `path` is `base` or lies below it.
 fn is_within(path: &str, base: &str) -> bool {
     let path = path.trim_matches('/');
@@ -156,13 +165,25 @@ impl WorksetsConfig {
             std::io::stdin()
                 .read_to_string(&mut content)
                 .context("Failed to read config from stdin")?;
+            // An empty pipe is far more likely a failed upstream command
+            // than a deliberately empty config.
+            if content.trim().is_empty() {
+                return Err(Kind::ConfigMissing {
+                    source: "<stdin>".into(),
+                    reason: "no config on stdin (input was empty)".into(),
+                }
+                .into());
+            }
             return Self::parse(&content, "<stdin>");
         }
         let source = path.display().to_string();
         let content = match std::fs::read_to_string(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(anyhow::Error::new(Kind::ConfigMissing { source })
-                    .context(format!("Failed to read {}", path.display())));
+                return Err(Kind::ConfigMissing {
+                    source,
+                    reason: "file not found".into(),
+                }
+                .into());
             }
             r => r.with_context(|| format!("Failed to read {}", path.display()))?,
         };
@@ -170,43 +191,47 @@ impl WorksetsConfig {
     }
 
     pub fn parse(content: &str, source: &str) -> Result<Self> {
-        let invalid = || Kind::ConfigInvalid {
-            source: source.to_string(),
-        };
-        let config: Self = toml::from_str(content)
-            .map_err(|e| anyhow::Error::new(invalid()).context(e.to_string()))
-            .with_context(|| format!("Failed to parse {}", source))?;
+        let mut config: Self = toml::from_str(content).map_err(|e| {
+            let detail = e.to_string();
+            Kind::ConfigInvalid {
+                source: source.to_string(),
+                reason: e.message().to_string(),
+                parse_error: Some(detail),
+            }
+        })?;
         let version = config.version.unwrap_or(1);
         if version == 0 || version > CONFIG_VERSION {
-            return Err(anyhow::Error::new(invalid()).context(format!(
-                "{}: unsupported config version {} (this git-workset supports version 1 to {})",
-                source, version, CONFIG_VERSION
-            )));
+            return Err(Kind::ConfigInvalid {
+                source: source.to_string(),
+                reason: format!(
+                    "unsupported config version {} (this git-workset supports version 1 to {})",
+                    version, CONFIG_VERSION
+                ),
+                parse_error: None,
+            }
+            .into());
+        }
+        for ws in config.workset.values_mut() {
+            for s in &mut ws.submodules.skip {
+                *s = normalise_path(s);
+            }
         }
         Ok(config)
     }
 
     /// Load config directly from the git tree without checking the file out.
-    /// Uses `git show <rev>:.git-workset.toml`.
     pub fn load_from_git(repo_path: &Path, rev: &str) -> Result<Self> {
         let spec = format!("{}:.git-workset.toml", rev);
-        let output = std::process::Command::new("git")
-            .args(["show", &spec])
-            .current_dir(repo_path)
-            .output()
-            .context("Failed to run git show")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(
-                anyhow::Error::new(Kind::ConfigMissing { source: spec }).context(format!(
-                    "No .git-workset.toml found at '{}'. Is the config committed?\n{}",
-                    rev,
-                    stderr.trim()
-                )),
-            );
-        }
-        let content =
-            String::from_utf8(output.stdout).context("Invalid UTF-8 in .git-workset.toml")?;
+        let content = match crate::git::read_blob_at(repo_path, rev, ".git-workset.toml")? {
+            Some(c) => c,
+            None => {
+                return Err(Kind::ConfigMissing {
+                    source: spec,
+                    reason: "no .git-workset.toml in that commit".into(),
+                }
+                .into())
+            }
+        };
         Self::parse(&content, &spec)
     }
 

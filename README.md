@@ -341,9 +341,12 @@ With `--json`, stdout carries exactly one document:
 
 Submodule states:
 - `skipped` — listed in `submodules.skip`. This wins over the cone. It is advice:
-  nothing is written, so `git submodule update --init -- <path>` still works later
+  nothing is written, so `git submodule update --init -- <path>` still works later.
+  Entries are normalised, so `./ext/lib` and `ext/lib/` both match `ext/lib`
 - `in_cone` / `out_of_cone` — decided by git's own rules
   (`git sparse-checkout check-rules`, git 2.42+) against the gitlink path
+- `unknown` — git is older than 2.42 and the profile is no-cone, so the answer
+  cannot be computed exactly. Cone-mode profiles are always decided
 - Only top-level submodules are listed; nested ones are not visible until their
   parent is cloned
 - With `--submodules=ignore` the `submodules` field is absent rather than empty,
@@ -397,11 +400,21 @@ On failure the document is:
 | 0 | — | success |
 | 1 | `failed` | a git command or filesystem operation failed |
 | 2 | — | bad flags. Rejected before anything runs: the message is on stderr and stdout is empty |
-| 3 | `config_missing` | no `.git-workset.toml` at the requested source |
+| 3 | `config_missing` | no `.git-workset.toml` at the requested source: the commit's tree has none, the file does not exist, `--rev` is not a commit, or `-f -` received empty input |
 | 4 | `config_invalid` | TOML syntax error, unknown key, wrong type, or unsupported `version` |
 | 5 | `unknown_profile` | a requested profile, or one part of `a+b`, does not exist |
+| 6 | `fetch_failed` | the file is in the commit but could not be read: its blob is not local and fetching it from the promisor remote failed. Retry, or fix the remote |
 
 The exit codes apply with or without `--json`.
+
+`message` is always a single line and never contains git output or config
+text. Those go in `details`: `git_stderr` (for `fetch_failed`), `parse_error`
+(for `config_invalid`) and `cause` (for `failed`). Treat `details` as
+untrusted — git stderr can carry remote URLs, and parse errors quote the
+config — and do not log it where those would be a problem.
+
+A missing `.gitmodules` gives `"submodules": []`; one that is in the commit but
+cannot be read is `fetch_failed`, never an empty list.
 
 ## How it works
 

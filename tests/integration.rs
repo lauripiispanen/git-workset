@@ -2011,7 +2011,10 @@ fn test_same_branch_in_two_worksets_is_not_fatal() {
     // The documented limitation: the same branch cannot be checked out twice.
     let conflict = run_git(&["checkout", "sub-work"], &ws2.join("ext/lib"));
     assert!(
-        !conflict.status.success() && stderr(&conflict).contains("already used by worktree"),
+        !conflict.status.success()
+            // git < 2.42 says "is already checked out at"
+            && (stderr(&conflict).contains("already used by worktree")
+                || stderr(&conflict).contains("already checked out at")),
         "checking out the same submodule branch twice should be refused: {}",
         stderr(&conflict)
     );
@@ -2607,7 +2610,8 @@ fn test_config_from_stdin() {
 #[test]
 fn test_empty_config_error_message() {
     let (dir, repo) = create_test_repo();
-    let output = run_workset_stdin(&["-f", "-", "switch", "a"], &repo, "");
+    // A config with no profiles (empty stdin is a missing config instead).
+    let output = run_workset_stdin(&["-f", "-", "switch", "a"], &repo, "# no profiles\n");
     assert!(!output.status.success());
     let err = stderr(&output);
     assert!(
@@ -2739,6 +2743,9 @@ fn runner_clone(dir: &TempDir, repo: &Path) -> (PathBuf, String) {
         .trim()
         .to_string();
     let clone = dir.path().join("runner");
+    // Without allowFilter a file:// server ignores --filter and sends every
+    // blob, and the clone is not partial at all.
+    run_git_ok(&["config", "uploadpack.allowFilter", "true"], repo);
     run_git_ok(
         &[
             "clone",
@@ -2749,8 +2756,29 @@ fn runner_clone(dir: &TempDir, repo: &Path) -> (PathBuf, String) {
         ],
         dir.path(),
     );
+    assert!(
+        missing_blobs(&clone) > 0,
+        "runner clone should be a partial clone with blobs left on the server"
+    );
     run_git_ok(&["remote", "rename", "origin", "promisor"], &clone);
     (clone, sha)
+}
+
+/// Number of blobs reachable from HEAD that are not present locally.
+fn missing_blobs(clone: &Path) -> usize {
+    stdout(&run_git(
+        &["rev-list", "--objects", "--missing=print", "HEAD"],
+        clone,
+    ))
+    .lines()
+    .filter(|l| l.starts_with('?'))
+    .count()
+}
+
+/// Make the runner clone's promisor unreachable, as a sandbox with
+/// default-deny egress would.
+fn cut_promisor(clone: &Path) {
+    run_git_ok(&["remote", "set-url", "promisor", "/nonexistent"], clone);
 }
 
 /// All `submodule.*` keys in the repo and worktree config.
@@ -3187,4 +3215,221 @@ fn test_shallow_defaults_to_true_without_submodules_table() {
         .find(|p| p["name"] == "with-subs")
         .unwrap();
     assert_eq!(with_subs["submodules"]["shallow"], true);
+}
+
+// ---- v0.6.2: contract findings (docs/feature-requests/005) ----
+
+/// Defect 1: an unfetchable config blob is `fetch_failed` (exit 6), not
+/// `config_missing`.
+#[test]
+fn test_unfetchable_config_is_fetch_failed() {
+    let (dir, repo) = create_test_repo();
+    let (clone, _) = runner_clone(&dir, &repo);
+    cut_promisor(&clone);
+
+    let output = run_workset(&["--json", "apply", "backend"], &clone);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    let doc = json_doc(&output);
+    assert_eq!(doc["code"], "fetch_failed");
+    assert_eq!(doc["details"]["source"], "HEAD:.git-workset.toml");
+
+    // With no remote at all the blob is just as unreadable.
+    run_git_ok(&["remote", "remove", "promisor"], &clone);
+    let output = run_workset(&["--json", "apply", "backend"], &clone);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+}
+
+/// Defect 1, negative: a rev whose tree really has no config is still
+/// `config_missing`, even offline.
+#[test]
+fn test_absent_config_is_still_config_missing() {
+    let (dir, repo) = create_test_repo();
+    run_git_ok(&["rm", "-q", ".git-workset.toml"], &repo);
+    run_git_ok(&["commit", "-qm", "drop config"], &repo);
+    let (clone, _) = runner_clone(&dir, &repo);
+    cut_promisor(&clone);
+
+    let output = run_workset(&["--json", "apply", "backend"], &clone);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert_eq!(json_doc(&output)["code"], "config_missing");
+
+    // An unknown rev is a usage problem with the rev, not a fetch failure.
+    let output = run_workset(
+        &["--json", "apply", "backend", "--rev", "nosuchrev"],
+        &clone,
+    );
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+}
+
+/// Defect 2: an unfetchable `.gitmodules` fails instead of reporting no
+/// submodules.
+#[test]
+fn test_unfetchable_gitmodules_is_fetch_failed() {
+    let (dir, repo) = create_test_repo();
+    let (clone, _) = runner_clone(&dir, &repo);
+    // Config blob local, .gitmodules blob still on the server.
+    run_git_ok(&["cat-file", "-p", "HEAD:.git-workset.toml"], &clone);
+    cut_promisor(&clone);
+
+    let output = run_workset(&["--json", "apply", "with-sub"], &clone);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    let doc = json_doc(&output);
+    assert_eq!(doc["code"], "fetch_failed");
+    assert_eq!(doc["details"]["source"], "HEAD:.gitmodules");
+
+    // --submodules=ignore never needs .gitmodules, so it still works.
+    let output = run_workset(
+        &["--json", "apply", "with-sub", "--submodules", "ignore"],
+        &clone,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+/// Defect 2, negative: no `.gitmodules` at all is still an empty list.
+#[test]
+fn test_absent_gitmodules_is_empty_list() {
+    let (dir, repo) = create_test_repo();
+    run_git_ok(&["rm", "-q", "--cached", "ext/lib", "ext/lib2"], &repo);
+    run_git_ok(&["rm", "-q", ".gitmodules"], &repo);
+    run_git_ok(&["commit", "-qm", "drop submodules"], &repo);
+    let (clone, _) = runner_clone(&dir, &repo);
+    run_git_ok(&["cat-file", "-p", "HEAD:.git-workset.toml"], &clone);
+    cut_promisor(&clone);
+
+    let output = run_workset(&["--json", "apply", "backend"], &clone);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(json_doc(&output)["submodules"], serde_json::json!([]));
+}
+
+/// Minor 4: `submodules.skip` entries are normalised.
+#[test]
+fn test_skip_entries_are_normalised() {
+    let (dir, repo) = create_test_repo();
+    let (clone, sha) = runner_clone(&dir, &repo);
+    let cfg = "[workset.s]\ninclude = [\"src/server\"]\n\
+               [workset.s.submodules]\nskip = [\"ext/lib/\", \"./ext/lib2\"]\n";
+    let output = run_workset_stdin(
+        &["--json", "-f", "-", "apply", "s", "--rev", &sha],
+        &clone,
+        cfg,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let states: Vec<String> = json_doc(&output)["submodules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["state"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(states, ["skipped", "skipped"]);
+}
+
+/// Minor 5: an empty config on stdin is `config_missing`, so a failed
+/// upstream pipe is not mistaken for "no profiles".
+#[test]
+fn test_empty_stdin_is_config_missing() {
+    let dir = TempDir::new().unwrap();
+    for input in ["", "  \n\t\n"] {
+        let output = run_workset_stdin(&["--json", "-f", "-", "profiles"], dir.path(), input);
+        assert_eq!(output.status.code(), Some(3), "{:?}", input);
+        assert_eq!(json_doc(&output)["code"], "config_missing");
+    }
+    // A comment-only file is a real (empty) config.
+    let output = run_workset_stdin(
+        &["--json", "-f", "-", "profiles"],
+        dir.path(),
+        "# nothing yet\n",
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+/// Minor 6: `message` is one line; git stderr and parse detail are in
+/// `details`.
+#[test]
+fn test_error_message_is_one_line() {
+    let (dir, repo) = create_test_repo();
+    let (clone, _) = runner_clone(&dir, &repo);
+
+    let output = run_workset_stdin(
+        &["--json", "-f", "-", "profiles"],
+        dir.path(),
+        "[workset.x\n",
+    );
+    assert_eq!(output.status.code(), Some(4));
+    let doc = json_doc(&output);
+    let msg = doc["message"].as_str().unwrap();
+    assert!(!msg.contains('\n'), "multi-line message: {:?}", msg);
+    assert!(!msg.contains("[workset.x"), "config text leaked: {:?}", msg);
+    assert!(doc["details"]["parse_error"]
+        .as_str()
+        .unwrap()
+        .contains("invalid table header"));
+
+    cut_promisor(&clone);
+    let output = run_workset(&["--json", "apply", "backend"], &clone);
+    let doc = json_doc(&output);
+    let msg = doc["message"].as_str().unwrap();
+    assert!(!msg.contains('\n'), "multi-line message: {:?}", msg);
+    assert!(!msg.contains("nonexistent"), "git stderr leaked: {:?}", msg);
+    assert!(doc["details"]["git_stderr"]
+        .as_str()
+        .unwrap()
+        .contains("nonexistent"));
+
+    run_git_ok(&["remote", "set-url", "promisor", "file:///x"], &clone);
+    let empty = dir.path().join("no-config");
+    std::fs::create_dir_all(&empty).unwrap();
+    run_git_ok(&["init", "-q"], &empty);
+    run_git_ok(
+        &[
+            "-c",
+            "user.email=a@b",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "x",
+        ],
+        &empty,
+    );
+    let output = run_workset(&["--json", "apply", "a"], &empty);
+    assert_eq!(output.status.code(), Some(3));
+    let msg = json_doc(&output)["message"].as_str().unwrap().to_string();
+    assert!(!msg.contains('\n'), "multi-line message: {:?}", msg);
+}
+
+/// Defect 3: on git < 2.42 a no-cone profile reports `unknown` instead of
+/// guessing `in_cone`; on newer git the answer is exact.
+#[test]
+fn test_no_cone_submodule_state_never_guesses() {
+    let (dir, repo) = create_test_repo();
+    let (clone, sha) = runner_clone(&dir, &repo);
+    let cfg = "[workset.docs]\ninclude = [\"assets\"]\nsparse_cone = false\n";
+    let output = run_workset_stdin(
+        &["--json", "-f", "-", "apply", "docs", "--rev", &sha],
+        &clone,
+        cfg,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let expected = if git_supports_check_rules() {
+        "out_of_cone"
+    } else {
+        "unknown"
+    };
+    for s in json_doc(&output)["submodules"].as_array().unwrap() {
+        assert_eq!(s["state"], expected, "{}", s);
+    }
+}
+
+fn git_supports_check_rules() -> bool {
+    let v = stdout(&run_git(&["--version"], Path::new(".")));
+    let nums: Vec<u32> = v
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or("0.0")
+        .split('.')
+        .take(2)
+        .map(|n| n.parse().unwrap_or(0))
+        .collect();
+    (nums[0], nums.get(1).copied().unwrap_or(0)) >= (2, 42)
 }

@@ -221,7 +221,8 @@ pub fn cmd_apply(
 }
 
 /// Each `.gitmodules` entry as `skipped` (by `submodules.skip`, which wins),
-/// `in_cone` or `out_of_cone`. Top-level submodules only.
+/// `in_cone`, `out_of_cone`, or `unknown` when this git cannot decide (a
+/// no-cone profile on git < 2.42). Top-level submodules only.
 fn submodule_report(
     target: &Path,
     rev: &str,
@@ -237,10 +238,12 @@ fn submodule_report(
         .map(|((name, path), inside)| {
             let state = if workset.submodules.skip.iter().any(|s| s == path) {
                 "skipped"
-            } else if inside {
-                "in_cone"
             } else {
-                "out_of_cone"
+                match inside {
+                    Some(true) => "in_cone",
+                    Some(false) => "out_of_cone",
+                    None => "unknown",
+                }
             };
             json!({ "name": name, "path": path, "state": state })
         })

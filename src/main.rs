@@ -282,7 +282,7 @@ fn main() {
         if json {
             println!("{}", error::to_json(&err));
         }
-        eprintln!("Error: {:#}", err);
+        eprintln!("Error: {}", error::human(&err));
         std::process::exit(error::exit_code(&err));
     }
 }
