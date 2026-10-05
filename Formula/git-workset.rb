@@ -18,12 +18,12 @@ class GitWorkset < Formula
 
   on_linux do
     on_intel do
-      url "https://github.com/lauripiispanen/git-workset/releases/download/v#{version}/git-workset-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/lauripiispanen/git-workset/releases/download/v#{version}/git-workset-x86_64-unknown-linux-musl.tar.gz"
       sha256 "SHA256_X86_LINUX"
     end
 
     on_arm do
-      url "https://github.com/lauripiispanen/git-workset/releases/download/v#{version}/git-workset-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/lauripiispanen/git-workset/releases/download/v#{version}/git-workset-aarch64-unknown-linux-musl.tar.gz"
       sha256 "SHA256_ARM_LINUX"
     end
   end

@@ -49,6 +49,14 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: true
+          # Statically linked: runs on any glibc (Debian 12, Ubuntu 22.04,
+          # RHEL 9) and on Alpine.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             use_cross: false
@@ -94,6 +102,12 @@ jobs:
           fi
         shell: bash
 
+      - name: Verify static linking (musl)
+        if: contains(matrix.target, 'musl')
+        run: |
+          file target/${{ matrix.target }}/release/git-workset
+          file target/${{ matrix.target }}/release/git-workset | grep -Eq 'statically linked|static-pie linked'
+
       - name: Package binary (Unix)
         if: "!contains(matrix.target, 'windows')"
         run: |
@@ -130,9 +144,27 @@ jobs:
             git-workset-${{ matrix.target }}.zip
             git-workset-${{ matrix.target }}.zip.sha256
 
+  smoke-musl:
+    name: Smoke test musl binary (${{ matrix.image }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:12-slim", "ubuntu:22.04", "alpine:3"]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: git-workset-x86_64-unknown-linux-musl
+
+      - name: Run --version in ${{ matrix.image }}
+        run: |
+          tar xzf git-workset-x86_64-unknown-linux-musl.tar.gz
+          docker run --rm -v "$PWD:/w" ${{ matrix.image }} /w/git-workset --version
+
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build, smoke-musl]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -148,6 +180,13 @@ jobs:
 
       - name: List artifacts
         run: ls -la artifacts/
+
+      - name: Write SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum git-workset-*.tar.gz git-workset-*.zip > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
 
       - name: Generate release notes from commits
         id: notes
@@ -178,6 +217,7 @@ jobs:
             artifacts/git-workset-*.tar.gz
             artifacts/git-workset-*.zip
             artifacts/git-workset-*.sha256
+            artifacts/SHA256SUMS
 
   deploy-pages:
     name: Deploy GitHub Pages
@@ -217,8 +257,8 @@ jobs:
           VERSION="${TAG#v}"
           SHA_X86_DARWIN=$(awk '{print $1}' artifacts/git-workset-x86_64-apple-darwin.tar.gz.sha256)
           SHA_ARM_DARWIN=$(awk '{print $1}' artifacts/git-workset-aarch64-apple-darwin.tar.gz.sha256)
-          SHA_X86_LINUX=$(awk '{print $1}' artifacts/git-workset-x86_64-unknown-linux-gnu.tar.gz.sha256)
-          SHA_ARM_LINUX=$(awk '{print $1}' artifacts/git-workset-aarch64-unknown-linux-gnu.tar.gz.sha256)
+          SHA_X86_LINUX=$(awk '{print $1}' artifacts/git-workset-x86_64-unknown-linux-musl.tar.gz.sha256)
+          SHA_ARM_LINUX=$(awk '{print $1}' artifacts/git-workset-aarch64-unknown-linux-musl.tar.gz.sha256)
 
           sed \
             -e "s/VERSION_PLACEHOLDER/${VERSION}/" \
