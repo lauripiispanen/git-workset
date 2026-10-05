@@ -279,6 +279,130 @@ leave `git status` in the main clone failing outright.
 
 Fetches more history for a shallow clone. Useful when you need `git blame` or `git log` beyond the shallow depth. Omit `--by` to fetch full history.
 
+## Using git-workset from CI and sandboxes
+
+`apply` and `profiles` are for tools that already own a checkout — a CI job, a
+container build, an agent sandbox — and want git-workset's profile semantics
+without anything else.
+
+### `git workset apply <profile>`
+
+Applies a profile's sparse patterns to an existing checkout, and by default does
+nothing else: it never fetches, clones, creates branches, probes remotes or
+writes global config, and works with no remote named `origin`. The only network
+I/O it can cause is git's own lazy blob fetch through a promisor remote on a
+partial clone.
+
+It can run before the first checkout, so only the cone is ever written:
+
+```sh
+git clone --no-checkout --filter=blob:none "$URL" repo
+git workset apply server -C repo --rev "$SHA" --json > workset.json
+git -C repo checkout --detach "$SHA"
+```
+
+Options:
+- `-C <path>` — operate on that checkout instead of the current directory
+- `--rev <commit-ish>` — read `.git-workset.toml` from that commit. Without it
+  (and without `-f`) the config comes from the target's `HEAD` — never the
+  working-tree file or the main worktree's
+- `--submodules=report|ignore|manage` (default `report`)
+  - `report`: touch nothing, write no `submodule.*` config, and report each
+    `.gitmodules` entry as `in_cone`, `out_of_cone` or `skipped`
+  - `ignore`: touch nothing, report nothing
+  - `manage`: what `switch` does — clone wanted submodules, mark skipped ones inactive
+- `--lfs=report|configure|pull|ignore` (default `report`)
+  - `report`: write nothing, report the resolved patterns. Does not need `git-lfs`
+  - `configure`: write `lfs.fetchinclude`/`lfs.fetchexclude`, do not pull
+  - `pull`: what `switch` does
+- `--no-marker` — do not record the active profile in the worktree's git dir
+
+In the default modes `apply` writes only what `git sparse-checkout` writes
+(`core.sparseCheckout`, `core.sparseCheckoutCone`, the `info/sparse-checkout`
+file, `extensions.worktreeConfig`) plus the `workset` marker.
+
+With `--json`, stdout carries exactly one document:
+
+```json
+{
+  "schema": "git-workset/apply@1",
+  "profile": "server+tools",
+  "profiles": ["server", "tools"],
+  "config_source": { "kind": "rev", "rev": "3f2a…", "path": ".git-workset.toml" },
+  "sparse": { "enabled": true, "cone": true, "patterns": ["src/server", "src/shared", "tools"] },
+  "submodules": [
+    { "name": "ext/lib", "path": "ext/lib", "state": "in_cone" },
+    { "name": "third_party/art", "path": "third_party/art", "state": "skipped" },
+    { "name": "docs/theme", "path": "docs/theme", "state": "out_of_cone" }
+  ],
+  "lfs": { "include": ["*.json"], "exclude": ["*.psd"] }
+}
+```
+
+Submodule states:
+- `skipped` — listed in `submodules.skip`. This wins over the cone. It is advice:
+  nothing is written, so `git submodule update --init -- <path>` still works later
+- `in_cone` / `out_of_cone` — decided by git's own rules
+  (`git sparse-checkout check-rules`, git 2.42+) against the gitlink path
+- Only top-level submodules are listed; nested ones are not visible until their
+  parent is cloned
+- With `--submodules=ignore` the `submodules` field is absent rather than empty,
+  and with `--lfs=ignore` so is `lfs`
+
+### `git workset profiles`
+
+Lists the profiles a config defines, in file order, with their fields. Needs no
+repository when given `-f`:
+
+```sh
+git workset profiles -f .git-workset.toml --json
+curl -s "$FORGE/raw/.git-workset.toml" | git workset profiles -f - --json
+```
+
+```json
+{
+  "schema": "git-workset/profiles@1",
+  "config_version": 1,
+  "profiles": [
+    { "name": "server", "description": "Backend server development",
+      "include": ["src/server", "src/shared"], "exclude": [], "sparse_cone": true,
+      "include_lfs": ["*.json"], "exclude_lfs": ["*.psd"],
+      "submodules": { "skip": ["third_party/art-pipeline"], "shallow": true } }
+  ]
+}
+```
+
+Options: `-C <path>`, `--rev <commit-ish>`, as for `apply`.
+
+### `--json`, errors and exit codes
+
+`--json` is a global flag. With it, stdout carries exactly one JSON document —
+on success or failure — and git's own output always goes to stderr. Every
+document has a `schema` field, `git-workset/<kind>@<major>`; adding fields is
+not a breaking change, a new major is.
+
+On failure the document is:
+
+```json
+{
+  "schema": "git-workset/error@1",
+  "code": "unknown_profile",
+  "message": "Workset 'srever' not found. Available: client, server",
+  "details": { "requested": "srever", "available": ["client", "server"] }
+}
+```
+
+| Exit | `code` | Meaning |
+|------|--------|---------|
+| 0 | — | success |
+| 1 | `failed` | a git command or filesystem operation failed |
+| 2 | — | bad flags. Rejected before anything runs: the message is on stderr and stdout is empty |
+| 3 | `config_missing` | no `.git-workset.toml` at the requested source |
+| 4 | `config_invalid` | TOML syntax error, unknown key, wrong type, or unsupported `version` |
+| 5 | `unknown_profile` | a requested profile, or one part of `a+b`, does not exist |
+
+The exit codes apply with or without `--json`.
+
 ## How it works
 
 Under the hood, `git workset` orchestrates standard git primitives:

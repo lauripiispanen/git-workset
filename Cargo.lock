@@ -159,11 +159,13 @@ dependencies = [
 
 [[package]]
 name = "git-workset"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
+ "indexmap",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
 ]

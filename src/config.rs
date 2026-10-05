@@ -1,8 +1,10 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
+
+use crate::error::Kind;
 
 /// Newest `.git-workset.toml` schema version this binary understands.
 pub const CONFIG_VERSION: u32 = 1;
@@ -18,7 +20,7 @@ pub struct WorksetsConfig {
     #[serde(default)]
     pub submodules: RepoSubmoduleConfig,
     #[serde(default)]
-    pub workset: BTreeMap<String, Workset>,
+    pub workset: IndexMap<String, Workset>,
 }
 
 /// Repo-wide `[submodules]` table.
@@ -145,22 +147,30 @@ impl WorksetsConfig {
                 .context("Failed to read config from stdin")?;
             return Self::parse(&content, "<stdin>");
         }
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        Self::parse(&content, &path.display().to_string())
+        let source = path.display().to_string();
+        let content = match std::fs::read_to_string(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(anyhow::Error::new(Kind::ConfigMissing { source })
+                    .context(format!("Failed to read {}", path.display())));
+            }
+            r => r.with_context(|| format!("Failed to read {}", path.display()))?,
+        };
+        Self::parse(&content, &source)
     }
 
     pub fn parse(content: &str, source: &str) -> Result<Self> {
-        let config: Self =
-            toml::from_str(content).with_context(|| format!("Failed to parse {}", source))?;
+        let invalid = || Kind::ConfigInvalid {
+            source: source.to_string(),
+        };
+        let config: Self = toml::from_str(content)
+            .map_err(|e| anyhow::Error::new(invalid()).context(e.to_string()))
+            .with_context(|| format!("Failed to parse {}", source))?;
         let version = config.version.unwrap_or(1);
         if version == 0 || version > CONFIG_VERSION {
-            bail!(
+            return Err(anyhow::Error::new(invalid()).context(format!(
                 "{}: unsupported config version {} (this git-workset supports version 1 to {})",
-                source,
-                version,
-                CONFIG_VERSION
-            );
+                source, version, CONFIG_VERSION
+            )));
         }
         Ok(config)
     }
@@ -176,31 +186,25 @@ impl WorksetsConfig {
             .context("Failed to run git show")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "No .git-workset.toml found at '{}' in remote. Is the config committed?\n{}",
-                rev,
-                stderr.trim()
+            return Err(
+                anyhow::Error::new(Kind::ConfigMissing { source: spec }).context(format!(
+                    "No .git-workset.toml found at '{}'. Is the config committed?\n{}",
+                    rev,
+                    stderr.trim()
+                )),
             );
         }
         let content =
             String::from_utf8(output.stdout).context("Invalid UTF-8 in .git-workset.toml")?;
-        Self::parse(&content, &format!("{}:.git-workset.toml", rev))
+        Self::parse(&content, &spec)
     }
 
     fn not_found(&self, name: &str) -> anyhow::Error {
-        let available: Vec<&str> = self.workset.keys().map(|s| s.as_str()).collect();
-        if available.is_empty() {
-            anyhow::anyhow!(
-                "Workset '{}' not found: the config defines no worksets",
-                name
-            )
-        } else {
-            anyhow::anyhow!(
-                "Workset '{}' not found. Available: {}",
-                name,
-                available.join(", ")
-            )
+        Kind::UnknownProfile {
+            requested: name.to_string(),
+            available: self.workset.keys().cloned().collect(),
         }
+        .into()
     }
 
     /// Resolve a profile name, composing `a+b` as the union of the parts.
@@ -221,7 +225,7 @@ impl WorksetsConfig {
     }
 
     pub fn template() -> Self {
-        let mut worksets = BTreeMap::new();
+        let mut worksets = IndexMap::new();
         worksets.insert(
             "all".to_string(),
             Workset {

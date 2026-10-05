@@ -2695,3 +2695,444 @@ fn test_child_git_output_goes_to_stderr() {
         "git's submodule output should be on stderr"
     );
 }
+
+// ---- v0.6.0: apply, profiles, --json, exit codes ----
+
+/// Run git-workset with a clean environment: an empty HOME and global
+/// config, and an optional PATH override.
+fn run_workset_isolated(args: &[&str], cwd: &Path, home: &Path, path: Option<&str>) -> Output {
+    let mut cmd = Command::new(git_workset_bin());
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("GIT_CONFIG_GLOBAL", home.join(".gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+        .env("GIT_CONFIG_VALUE_0", "always");
+    if let Some(p) = path {
+        cmd.env("PATH", p);
+    }
+    cmd.output().expect("failed to execute git-workset")
+}
+
+/// stdout must be exactly one JSON document.
+fn json_doc(output: &Output) -> serde_json::Value {
+    let out = stdout(output);
+    let mut stream = serde_json::Deserializer::from_str(&out).into_iter::<serde_json::Value>();
+    let doc = stream
+        .next()
+        .unwrap_or_else(|| panic!("no JSON on stdout; stderr: {}", stderr(output)))
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({}): {:?}", e, out));
+    assert!(
+        stream.next().is_none(),
+        "stdout has more than one document: {:?}",
+        out
+    );
+    doc
+}
+
+/// A `--no-checkout` partial clone of the fixture with `origin` renamed, as
+/// a sandbox runner would hand it over. Returns the clone and the commit.
+fn runner_clone(dir: &TempDir, repo: &Path) -> (PathBuf, String) {
+    let sha = stdout(&run_git(&["rev-parse", "HEAD"], repo))
+        .trim()
+        .to_string();
+    let clone = dir.path().join("runner");
+    run_git_ok(
+        &[
+            "clone",
+            "--no-checkout",
+            "--filter=blob:none",
+            &format!("file://{}", repo.display()),
+            clone.to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_git_ok(&["remote", "rename", "origin", "promisor"], &clone);
+    (clone, sha)
+}
+
+/// All `submodule.*` keys in the repo and worktree config.
+fn submodule_config(repo: &Path) -> String {
+    let mut all = String::new();
+    for scope in ["--local", "--worktree"] {
+        let out = run_git(&["config", scope, "--get-regexp", r"^submodule\."], repo);
+        all.push_str(&stdout(&out));
+    }
+    all
+}
+
+/// Apply before the first checkout: only the cone is ever written, with no
+/// `origin` and no network beyond the promisor.
+#[test]
+fn test_apply_before_first_checkout() {
+    let (dir, repo) = create_test_repo();
+    let (clone, sha) = runner_clone(&dir, &repo);
+
+    let output = run_workset(&["apply", "backend", "--rev", &sha], &clone);
+    assert!(output.status.success(), "apply failed: {}", stderr(&output));
+    run_git_ok(&["checkout", "--detach", &sha], &clone);
+
+    assert!(clone.join("src/server/hello.txt").exists());
+    assert!(clone.join("src/shared/hello.txt").exists());
+    assert!(clone.join(".git-workset.toml").exists(), "root files stay");
+    assert!(!clone.join("src/client/hello.txt").exists());
+    assert!(!clone.join("assets/hello.txt").exists());
+}
+
+/// Requirement 1: apply --json reports each submodule's name, path and state,
+/// with `skipped` winning over the cone.
+#[test]
+fn test_apply_json_reports_submodule_states() {
+    let (dir, repo) = create_test_repo();
+    let (clone, sha) = runner_clone(&dir, &repo);
+
+    let output = run_workset(&["--json", "apply", "with-sub", "--rev", &sha], &clone);
+    assert!(output.status.success(), "apply failed: {}", stderr(&output));
+    let doc = json_doc(&output);
+    assert_eq!(doc["schema"], "git-workset/apply@1");
+    assert_eq!(doc["config_source"]["kind"], "rev");
+    assert_eq!(doc["config_source"]["rev"], sha.as_str());
+    assert_eq!(
+        doc["submodules"],
+        serde_json::json!([
+            { "name": "ext/lib", "path": "ext/lib", "state": "in_cone" },
+            { "name": "ext/lib2", "path": "ext/lib2", "state": "skipped" },
+        ])
+    );
+
+    // backend skips both; frontend skips both; a profile outside ext/ that
+    // skips nothing reports them out of the cone.
+    let cfg = "[workset.server-only]\ninclude = [\"src/server\"]\n";
+    let output = run_workset_stdin(&["--json", "-f", "-", "apply", "server-only"], &clone, cfg);
+    assert!(output.status.success(), "apply failed: {}", stderr(&output));
+    let states: Vec<String> = json_doc(&output)["submodules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["state"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(states, ["out_of_cone", "out_of_cone"]);
+}
+
+/// Requirement 2: report and ignore write no submodule config, so a deferred
+/// submodule can still be initialised with plain git afterwards.
+#[test]
+fn test_apply_writes_no_submodule_config_and_deferred_init_works() {
+    let (dir, repo) = create_test_repo();
+    let (clone, sha) = runner_clone(&dir, &repo);
+
+    for mode in ["report", "ignore"] {
+        let output = run_workset(
+            &["apply", "with-sub", "--rev", &sha, "--submodules", mode],
+            &clone,
+        );
+        assert!(output.status.success(), "apply failed: {}", stderr(&output));
+        assert_eq!(
+            submodule_config(&clone),
+            "",
+            "--submodules={} wrote submodule config",
+            mode
+        );
+    }
+    run_git_ok(&["checkout", "--detach", &sha], &clone);
+    assert!(
+        !clone.join("ext/lib/.git").exists(),
+        "apply must not clone submodules"
+    );
+
+    // ext/lib2 was reported skipped; the runner can still bring it in later.
+    run_git_ok(&["submodule", "update", "--init", "--", "ext/lib2"], &clone);
+    assert!(
+        clone.join("ext/lib2/lib2.txt").exists(),
+        "deferred init should materialise the skipped submodule"
+    );
+}
+
+/// `--submodules=ignore` leaves the field out, so "none" and "didn't look"
+/// differ.
+#[test]
+fn test_apply_ignore_omits_submodules_field() {
+    let (dir, repo) = create_test_repo();
+    let (clone, sha) = runner_clone(&dir, &repo);
+    let output = run_workset(
+        &[
+            "--json",
+            "apply",
+            "with-sub",
+            "--rev",
+            &sha,
+            "--submodules",
+            "ignore",
+        ],
+        &clone,
+    );
+    assert!(output.status.success(), "apply failed: {}", stderr(&output));
+    let doc = json_doc(&output);
+    assert!(doc.get("submodules").is_none(), "{}", doc);
+}
+
+/// Unreachable submodule URLs do not matter: apply does no submodule I/O.
+#[test]
+fn test_apply_succeeds_with_unreachable_submodule_urls() {
+    let (dir, repo) = create_test_repo();
+    std::fs::rename(dir.path().join("subrepo"), dir.path().join("gone")).unwrap();
+    let (clone, sha) = runner_clone(&dir, &repo);
+
+    let output = run_workset(&["apply", "with-subs", "--rev", &sha], &clone);
+    assert!(
+        output.status.success(),
+        "apply must not touch submodule remotes: {}",
+        stderr(&output)
+    );
+}
+
+/// Requirement 3: with --json stdout is one JSON document even though git
+/// printed output, and git's output is on stderr.
+#[test]
+fn test_apply_json_stdout_is_pure() {
+    let (dir, repo) = create_test_repo();
+    run_git_ok(&["branch", "pure"], &repo);
+    let wt = dir.path().join("wt-pure");
+    let output = run_workset(
+        &["carve", wt.to_str().unwrap(), "pure", "-w", "backend"],
+        &repo,
+    );
+    assert!(output.status.success(), "carve failed: {}", stderr(&output));
+
+    // An isolated `git submodule update` prints "Submodule path ... checked
+    // out" on git's stdout; it must end up on ours as stderr.
+    let output = run_workset(
+        &[
+            "--json",
+            "--isolated-submodules",
+            "apply",
+            "with-sub",
+            "--submodules",
+            "manage",
+            "--lfs",
+            "configure",
+        ],
+        &wt,
+    );
+    assert!(output.status.success(), "apply failed: {}", stderr(&output));
+    let doc = json_doc(&output);
+    assert_eq!(doc["profile"], "with-sub");
+    assert!(
+        stderr(&output).contains("Submodule path 'ext/lib'"),
+        "git's stdout should be forwarded to stderr: {}",
+        stderr(&output)
+    );
+    assert!(
+        wt.join("ext/lib/lib.txt").exists(),
+        "manage clones the submodule"
+    );
+}
+
+/// Errors under --json are an error@1 document on stdout with a distinct
+/// exit code.
+#[test]
+fn test_json_errors_and_exit_codes() {
+    let (dir, repo) = create_test_repo();
+    let (clone, sha) = runner_clone(&dir, &repo);
+
+    let output = run_workset(&["--json", "apply", "srever", "--rev", &sha], &clone);
+    assert_eq!(output.status.code(), Some(5), "{}", stderr(&output));
+    let doc = json_doc(&output);
+    assert_eq!(doc["schema"], "git-workset/error@1");
+    assert_eq!(doc["code"], "unknown_profile");
+    assert_eq!(doc["details"]["requested"], "srever");
+    assert!(doc["details"]["available"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("backend")));
+
+    // An empty segment in a+b is an unknown profile, not a crash.
+    let output = run_workset(&["--json", "apply", "backend+", "--rev", &sha], &clone);
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(json_doc(&output)["code"], "unknown_profile");
+
+    let output = run_workset_stdin(
+        &["--json", "-f", "-", "apply", "a"],
+        &clone,
+        "[workset.a]\nincldue = []\n",
+    );
+    assert_eq!(output.status.code(), Some(4));
+    let doc = json_doc(&output);
+    assert_eq!(doc["code"], "config_invalid");
+    assert!(doc["message"].as_str().unwrap().contains("incldue"));
+
+    let output = run_workset_stdin(
+        &["--json", "-f", "-", "apply", "a"],
+        &clone,
+        "version = 9\n[workset.a]\n",
+    );
+    assert_eq!(output.status.code(), Some(4));
+
+    // A commit with no .git-workset.toml.
+    let empty = dir.path().join("bare-history");
+    std::fs::create_dir_all(&empty).unwrap();
+    run_git_ok(&["init", "-q"], &empty);
+    run_git_ok(
+        &[
+            "-c",
+            "user.email=a@b",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "x",
+        ],
+        &empty,
+    );
+    let output = run_workset(&["--json", "apply", "a"], &empty);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert_eq!(json_doc(&output)["code"], "config_missing");
+
+    // Bad flags are clap's: exit 2, empty stdout.
+    let output = run_workset(&["--json", "apply", "a", "--submodules", "maybe"], &clone);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+}
+
+/// LFS report needs no git-lfs and writes no lfs.* keys.
+#[test]
+fn test_apply_lfs_report_needs_no_git_lfs() {
+    let (dir, repo) = create_test_repo();
+    let (clone, sha) = runner_clone(&dir, &repo);
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // A PATH holding only git itself. Git for Windows needs its DLLs and
+    // finds git-lfs through its exec-path regardless of PATH, so the
+    // restriction is only meaningful (and only applied) on Unix.
+    let path = if cfg!(windows) {
+        None
+    } else {
+        let git = stdout(&run_git(&["--exec-path"], &repo)).trim().to_string();
+        let bin = dir.path().join("only-git");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::copy(Path::new(&git).join("git"), bin.join("git")).unwrap();
+        Some(bin.display().to_string())
+    };
+
+    let cfg = "[workset.art]\ninclude = [\"assets\"]\ninclude_lfs = [\"*.png\"]\nexclude_lfs = [\"*.psd\"]\n";
+    let cfg_file = dir.path().join("lfs.toml");
+    std::fs::write(&cfg_file, cfg).unwrap();
+    let output = run_workset_isolated(
+        &["--json", "-f", cfg_file.to_str().unwrap(), "apply", "art"],
+        &clone,
+        &home,
+        path.as_deref(),
+    );
+    assert!(output.status.success(), "apply failed: {}", stderr(&output));
+    let doc = json_doc(&output);
+    assert_eq!(doc["lfs"]["include"], serde_json::json!(["*.png"]));
+    assert_eq!(doc["lfs"]["exclude"], serde_json::json!(["*.psd"]));
+    let lfs = run_git(&["config", "--get-regexp", r"^lfs\."], &clone);
+    assert_eq!(stdout(&lfs), "", "no lfs.* key may be written");
+    drop(sha);
+}
+
+/// apply never writes global config.
+#[test]
+fn test_apply_writes_no_global_config() {
+    let (dir, repo) = create_test_repo();
+    let (clone, sha) = runner_clone(&dir, &repo);
+    let home = dir.path().join("empty-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let output = run_workset_isolated(&["apply", "with-sub", "--rev", &sha], &clone, &home, None);
+    assert!(output.status.success(), "apply failed: {}", stderr(&output));
+    assert!(
+        !home.join(".gitconfig").exists(),
+        "apply created a global config"
+    );
+}
+
+/// `--no-marker` leaves no workset state behind; the default records it.
+#[test]
+fn test_apply_marker_is_optional() {
+    let (dir, repo) = create_test_repo();
+    let (clone, sha) = runner_clone(&dir, &repo);
+    let marker = clone.join(".git/workset");
+
+    let output = run_workset(&["apply", "backend", "--rev", &sha, "--no-marker"], &clone);
+    assert!(output.status.success(), "apply failed: {}", stderr(&output));
+    assert!(!marker.exists(), "--no-marker wrote the marker");
+
+    let output = run_workset(&["apply", "backend", "--rev", &sha], &clone);
+    assert!(output.status.success(), "apply failed: {}", stderr(&output));
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "backend");
+}
+
+/// `-C` targets another checkout; config comes from that checkout's HEAD.
+#[test]
+fn test_apply_dash_c_reads_target_head() {
+    let (dir, repo) = create_test_repo();
+    let wt = dir.path().join("wt-dash-c");
+    carve_ok(&repo, &wt, "dash-c", "backend");
+    let cfg = std::fs::read_to_string(wt.join(".git-workset.toml"))
+        .unwrap()
+        .replace(
+            "include = [\"src/client\", \"src/shared\"]",
+            "include = [\"assets\"]",
+        );
+    std::fs::write(wt.join(".git-workset.toml"), cfg).unwrap();
+    run_git_ok(&["commit", "-am", "branch-local frontend"], &wt);
+
+    let output = run_workset(&["apply", "frontend", "-C", wt.to_str().unwrap()], &repo);
+    assert!(output.status.success(), "apply failed: {}", stderr(&output));
+    assert!(wt.join("assets/hello.txt").exists());
+    assert!(!wt.join("src/client/hello.txt").exists());
+}
+
+/// `profiles -f` works outside any repository and keeps file order.
+#[test]
+fn test_profiles_outside_repo_in_file_order() {
+    let dir = TempDir::new().unwrap();
+    let cfg = "[workset.zeta]\ndescription = \"last alphabetically\"\ninclude = [\"z\"]\n\
+               [workset.alpha]\ninclude = [\"a\"]\n[workset.alpha.submodules]\nskip = [\"x\"]\n";
+    let output = run_workset_stdin(&["--json", "-f", "-", "profiles"], dir.path(), cfg);
+    assert!(
+        output.status.success(),
+        "profiles failed: {}",
+        stderr(&output)
+    );
+    let doc = json_doc(&output);
+    assert_eq!(doc["schema"], "git-workset/profiles@1");
+    assert_eq!(doc["config_version"], 1);
+    let names: Vec<&str> = doc["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["zeta", "alpha"], "file order, not alphabetical");
+    assert_eq!(doc["profiles"][0]["description"], "last alphabetically");
+    assert_eq!(
+        doc["profiles"][1]["submodules"]["skip"],
+        serde_json::json!(["x"])
+    );
+}
+
+/// `profiles --rev` reads a commit; a missing config is exit 3.
+#[test]
+fn test_profiles_from_rev() {
+    let (dir, repo) = create_test_repo();
+    let (clone, sha) = runner_clone(&dir, &repo);
+    let output = run_workset(&["--json", "profiles", "--rev", &sha], &clone);
+    assert!(
+        output.status.success(),
+        "profiles failed: {}",
+        stderr(&output)
+    );
+    let first = &json_doc(&output)["profiles"][0];
+    assert_eq!(first["name"], "backend");
+    assert_eq!(
+        first["include"],
+        serde_json::json!(["src/server", "src/shared"])
+    );
+}

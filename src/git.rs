@@ -9,28 +9,29 @@ const MIN_WORKTREE_CONFIG_VERSION: (u32, u32) = (2, 20);
 
 /// Find the root of the main git repository (not a worktree).
 pub fn find_repo_root() -> Result<PathBuf> {
+    find_repo_root_from(&std::env::current_dir()?)
+}
+
+/// Like `find_repo_root`, for the repository containing `cwd`.
+pub fn find_repo_root_from(cwd: &Path) -> Result<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--git-common-dir"])
+        .current_dir(cwd)
         .output()
         .context("Failed to run git")?;
     if !output.status.success() {
         bail!("Not inside a git repository");
     }
     let git_common_dir = String::from_utf8(output.stdout)?.trim().to_string();
-    let common_path = PathBuf::from(&git_common_dir);
+    // Relative paths are relative to `cwd`, not to the process.
+    let common_path = cwd.join(&git_common_dir);
 
     // git-common-dir returns the .git directory; we want the parent
     let root = if common_path.ends_with(".git") {
-        let parent = common_path
+        common_path
             .parent()
             .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        // When .git is relative (common case), parent is "" — normalize to "."
-        if parent.as_os_str().is_empty() {
-            PathBuf::from(".")
-        } else {
-            parent
-        }
+            .unwrap_or_else(|| cwd.to_path_buf())
     } else {
         // bare repo or worktree — resolve to absolute
         let abs = std::fs::canonicalize(&common_path)?;
@@ -380,6 +381,110 @@ pub(crate) fn parse_submodule_entries(worktree_path: &Path) -> Result<Vec<(Strin
         .collect())
 }
 
+/// (name, path) pairs from `.gitmodules` at `rev`, read from the object store
+/// so it works before the first checkout.
+pub fn parse_submodule_entries_at(cwd: &Path, rev: &str) -> Result<Vec<(String, String)>> {
+    let blob = format!("{}:.gitmodules", rev);
+    if run_git_output(&["cat-file", "-e", &blob], cwd).is_err() {
+        return Ok(vec![]);
+    }
+    let output = run_git_output(
+        &[
+            "config",
+            "--blob",
+            &blob,
+            "--get-regexp",
+            r"submodule\..*\.path",
+        ],
+        cwd,
+    )?;
+    Ok(output
+        .lines()
+        .filter_map(|line| {
+            let (key, path) = line.split_once(' ')?;
+            let name = key.strip_prefix("submodule.")?.strip_suffix(".path")?;
+            Some((name.to_string(), path.to_string()))
+        })
+        .collect())
+}
+
+/// Which of `paths` fall inside the sparse patterns, by git's own rules
+/// (`git sparse-checkout check-rules`, git 2.42+). On older git, cone mode
+/// is decided here; no-cone patterns are too rich to re-implement, so every
+/// path is reported in the cone.
+pub fn paths_in_sparse(
+    cwd: &Path,
+    sparse: Option<&(bool, Vec<String>)>,
+    paths: &[String],
+) -> Result<Vec<bool>> {
+    use std::io::Write;
+    let Some((cone, patterns)) = sparse else {
+        return Ok(vec![true; paths.len()]);
+    };
+    if paths.is_empty() {
+        return Ok(vec![]);
+    }
+    if git_version()? < (2, 42) {
+        return Ok(paths
+            .iter()
+            .map(|p| !*cone || in_cone_fallback(p, patterns))
+            .collect());
+    }
+
+    let rules = tempfile_in_git_dir(cwd, "workset-rules", &patterns.join("\n"))?;
+    let mode = if *cone { "--cone" } else { "--no-cone" };
+    let mut child = Command::new("git")
+        .args(["sparse-checkout", "check-rules", mode, "--rules-file"])
+        .arg(&rules)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to run git sparse-checkout check-rules")?;
+    child
+        .stdin
+        .take()
+        .context("no stdin")?
+        .write_all(paths.join("\n").as_bytes())?;
+    let output = child.wait_with_output()?;
+    let _ = std::fs::remove_file(&rules);
+    if !output.status.success() {
+        bail!(
+            "git sparse-checkout check-rules failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let matched: Vec<&str> = std::str::from_utf8(&output.stdout)?.lines().collect();
+    Ok(paths
+        .iter()
+        .map(|p| matched.contains(&p.as_str()))
+        .collect())
+}
+
+/// Cone semantics: a path is in the cone if it is under an included
+/// directory, or is a direct child of the root or of an ancestor of one.
+fn in_cone_fallback(path: &str, dirs: &[String]) -> bool {
+    let path = path.trim_matches('/');
+    let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    dirs.iter().any(|d| {
+        let d = d.trim_matches('/');
+        path == d
+            || path.starts_with(&format!("{}/", d))
+            || parent.is_empty()
+            || d == parent
+            || d.starts_with(&format!("{}/", parent))
+    })
+}
+
+/// Write a scratch file inside this worktree's git dir.
+fn tempfile_in_git_dir(cwd: &Path, name: &str, content: &str) -> Result<PathBuf> {
+    let path = worktree_git_dir(cwd)?.join(format!("{}.{}", name, std::process::id()));
+    std::fs::write(&path, content)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(path)
+}
+
 /// The installed git version as (major, minor).
 pub fn git_version() -> Result<(u32, u32)> {
     let out = run_git_output(&["--version"], &std::env::current_dir()?)?;
@@ -525,6 +630,7 @@ pub(crate) fn config_file_set(file: &Path, key: &str, value: &str) -> Result<()>
     eprintln!("  git config -f {} {} {}", file_str, key, value);
     let status = config_file_command(file_str)
         .args([key, value])
+        .stdout(stdout_to_stderr())
         .status()
         .with_context(|| format!("Failed to set {} in {}", key, file_str))?;
     if !status.success() {
@@ -538,6 +644,7 @@ pub(crate) fn config_file_unset(file: &Path, key: &str) -> Result<()> {
     eprintln!("  git config -f {} --unset {}", file_str, key);
     let status = config_file_command(file_str)
         .args(["--unset", key])
+        .stdout(stdout_to_stderr())
         .status()
         .with_context(|| format!("Failed to unset {} in {}", key, file_str))?;
     if !status.success() {
@@ -941,9 +1048,21 @@ fn share_submodule(
     attach_submodule_worktree(main_repo, name, sub_path, worktree_path, &pin, shallow)
 }
 
-/// Configure LFS fetch include/exclude and optionally pull.
+/// Configure LFS fetch include/exclude and pull.
 /// Uses --worktree scoped config so the main repo is unaffected.
 pub fn configure_lfs(worktree_path: &Path, workset: &Workset) -> Result<()> {
+    configure_lfs_filters(worktree_path, workset)?;
+
+    // Pull LFS content matching the filters
+    if !workset.include_lfs.is_empty() || !workset.exclude_lfs.is_empty() {
+        run_git(&["lfs", "pull"], worktree_path)?;
+    }
+
+    Ok(())
+}
+
+/// Write `lfs.fetchinclude`/`lfs.fetchexclude` without pulling anything.
+pub fn configure_lfs_filters(worktree_path: &Path, workset: &Workset) -> Result<()> {
     if !workset.include_lfs.is_empty() {
         let include_val = workset.include_lfs.join(",");
         run_git(
@@ -959,12 +1078,6 @@ pub fn configure_lfs(worktree_path: &Path, workset: &Workset) -> Result<()> {
             worktree_path,
         )?;
     }
-
-    // Pull LFS content matching the filters
-    if !workset.include_lfs.is_empty() || !workset.exclude_lfs.is_empty() {
-        run_git(&["lfs", "pull"], worktree_path)?;
-    }
-
     Ok(())
 }
 
@@ -1098,4 +1211,24 @@ pub fn remove_worktree(main_repo: &Path, path: &Path, force: bool) -> Result<()>
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_cone_fallback;
+
+    /// Must agree with `git sparse-checkout check-rules --cone`.
+    #[test]
+    fn cone_fallback_matches_git() {
+        let dirs = vec!["src/server".to_string()];
+        for (path, expected) in [
+            ("src/server/x/lib", true),
+            ("src/lib", true),  // sibling file of an included dir's parent
+            ("toplib", true),   // root files are always in the cone
+            ("ext/lib", false), // under a directory that is not an ancestor
+            ("assets/lib", false),
+        ] {
+            assert_eq!(in_cone_fallback(path, &dirs), expected, "{}", path);
+        }
+    }
 }

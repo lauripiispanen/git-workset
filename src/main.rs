@@ -1,6 +1,8 @@
 mod config;
 mod doctor;
+mod error;
 mod git;
+mod plumbing;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -8,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use config::{SubmoduleSharing, WorksetsConfig};
+use plumbing::{ApplyOptions, ConfigSource, LfsMode, SubmoduleMode};
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +36,11 @@ struct Cli {
     /// Give each workset its own submodule clone
     #[arg(long, global = true, default_value_t = false)]
     isolated_submodules: bool,
+
+    /// Print exactly one JSON document on stdout (apply, profiles, and errors).
+    /// git's own output goes to stderr.
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -127,16 +135,49 @@ enum Commands {
         #[arg(long)]
         by: Option<u32>,
     },
+
+    /// Apply a profile's sparse patterns to an existing checkout, offline.
+    /// Never fetches, clones or creates branches; by default it reports
+    /// submodules and LFS patterns instead of acting on them.
+    Apply {
+        /// Workset profile name (use "a+b" to compose multiple)
+        profile: String,
+        /// Operate on this checkout instead of the current directory
+        #[arg(short = 'C', value_name = "PATH")]
+        dir: Option<PathBuf>,
+        /// Read the config from this commit instead of HEAD
+        #[arg(long, conflicts_with = "config")]
+        rev: Option<String>,
+        /// What to do about submodules
+        #[arg(long, value_enum, default_value_t = SubmoduleMode::Report)]
+        submodules: SubmoduleMode,
+        /// What to do about LFS
+        #[arg(long, value_enum, default_value_t = LfsMode::Report)]
+        lfs: LfsMode,
+        /// Do not record the active profile in the worktree's git dir
+        #[arg(long)]
+        no_marker: bool,
+    },
+
+    /// List the profiles a config defines, in file order
+    Profiles {
+        /// Read the config from this checkout instead of the current directory
+        #[arg(short = 'C', value_name = "PATH")]
+        dir: Option<PathBuf>,
+        /// Read the config from this commit instead of HEAD
+        #[arg(long, conflicts_with = "config")]
+        rev: Option<String>,
+    },
 }
 
 /// The submodule sharing mode recorded in a worktree at carve time.
-fn persisted_sharing(worktree_path: &Path) -> Option<SubmoduleSharing> {
+pub(crate) fn persisted_sharing(worktree_path: &Path) -> Option<SubmoduleSharing> {
     let gitdir = git::worktree_git_dir(worktree_path).ok()?;
     let value = git::config_file_get(&gitdir.join("config.worktree"), "workset.submoduleSharing")?;
     SubmoduleSharing::parse(&value).ok()
 }
 
-fn record_sharing(worktree_path: &Path, mode: SubmoduleSharing) -> Result<()> {
+pub(crate) fn record_sharing(worktree_path: &Path, mode: SubmoduleSharing) -> Result<()> {
     git::run_git(
         &[
             "config",
@@ -151,7 +192,7 @@ fn record_sharing(worktree_path: &Path, mode: SubmoduleSharing) -> Result<()> {
 /// Resolve the submodule sharing mode (§3.2). Highest wins:
 /// CLI flag → mode already recorded in this worktree → git config →
 /// `.git-workset.toml` → default (`shared`).
-fn resolve_sharing(
+pub(crate) fn resolve_sharing(
     repo_root: &Path,
     config: &WorksetsConfig,
     cli: Option<SubmoduleSharing>,
@@ -234,9 +275,21 @@ fn print_submodule_summary(outcome: &git::SubmoduleOutcome) {
     );
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
+    let json = cli.json;
+    if let Err(err) = run(cli) {
+        if json {
+            println!("{}", error::to_json(&err));
+        }
+        eprintln!("Error: {:#}", err);
+        std::process::exit(error::exit_code(&err));
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
     let sharing_flag = cli.sharing_flag();
+    let json = cli.json;
 
     // Resolve the explicit config path to absolute *now*, before any subcommand
     // changes the working directory.
@@ -247,6 +300,36 @@ fn main() -> Result<()> {
     };
 
     match cli.command {
+        Commands::Apply {
+            profile,
+            dir,
+            rev,
+            submodules,
+            lfs,
+            no_marker,
+        } => plumbing::cmd_apply(
+            &profile,
+            dir.as_deref(),
+            &ConfigSource {
+                file: config_override,
+                rev,
+            },
+            &ApplyOptions {
+                submodules,
+                lfs,
+                no_marker,
+            },
+            sharing_flag,
+            json,
+        ),
+        Commands::Profiles { dir, rev } => plumbing::cmd_profiles(
+            dir.as_deref(),
+            &ConfigSource {
+                file: config_override,
+                rev,
+            },
+            json,
+        ),
         Commands::Init => cmd_init(),
         Commands::Clone {
             url,
@@ -353,6 +436,7 @@ fn cmd_clone(
         let probe_status = Command::new("git")
             .args(&probe_args)
             .env("GIT_LFS_SKIP_SMUDGE", "1")
+            .stdout(git::stdout_to_stderr())
             .status()
             .context("Failed to probe remote")?;
         if !probe_status.success() {
